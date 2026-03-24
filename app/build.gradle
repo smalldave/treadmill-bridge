@@ -11,8 +11,8 @@ android {
         applicationId "com.treadmill.bridge"
         minSdk 24
         targetSdk 33
-        versionCode 17
-        versionName "0.17.0"
+        versionCode 23
+        versionName "1.5.0"
     }
 
     compileOptions {
