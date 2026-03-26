@@ -1,4 +1,4 @@
-.PHONY: build release install clean version lint help
+.PHONY: build release install clean version lint test help
 
 VERSION ?= $(shell git describe --tags --always 2>/dev/null | sed 's/^v//' || echo "0.0.0")
 GRADLE  := ./gradlew
@@ -17,6 +17,9 @@ release: ## Build release APK
 
 install: build ## Build and install debug APK via adb
 	adb install $(APK_DIR)/debug/treadmill-bridge-$(VERSION)-debug.apk
+
+test: ## Run unit tests
+	$(GRADLE) testDebugUnitTest
 
 clean: ## Clean build artifacts
 	$(GRADLE) clean

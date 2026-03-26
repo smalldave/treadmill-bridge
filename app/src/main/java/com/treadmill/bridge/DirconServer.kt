@@ -20,21 +20,21 @@ class DirconServer(
 ) {
     companion object {
         private const val TAG = "Dircon"
-        private const val VERSION: Byte = 0x01
+        internal const val VERSION: Byte = 0x01
 
         // Message types
-        private const val MSG_DISCOVER_SERVICES: Byte = 0x01
-        private const val MSG_DISCOVER_CHARS: Byte = 0x02
-        private const val MSG_READ_CHAR: Byte = 0x03
-        private const val MSG_WRITE_CHAR: Byte = 0x04
-        private const val MSG_ENABLE_NOTIFY: Byte = 0x05
-        private const val MSG_UNSOLICITED_NOTIFY: Byte = 0x06
+        internal const val MSG_DISCOVER_SERVICES: Byte = 0x01
+        internal const val MSG_DISCOVER_CHARS: Byte = 0x02
+        internal const val MSG_READ_CHAR: Byte = 0x03
+        internal const val MSG_WRITE_CHAR: Byte = 0x04
+        internal const val MSG_ENABLE_NOTIFY: Byte = 0x05
+        internal const val MSG_UNSOLICITED_NOTIFY: Byte = 0x06
         private const val MSG_UNKNOWN_07: Byte = 0x07
 
         // Response codes
-        private const val RESP_SUCCESS: Byte = 0x00
-        private const val RESP_SERVICE_NOT_FOUND: Byte = 0x03
-        private const val RESP_CHAR_NOT_FOUND: Byte = 0x04
+        internal const val RESP_SUCCESS: Byte = 0x00
+        internal const val RESP_SERVICE_NOT_FOUND: Byte = 0x03
+        internal const val RESP_CHAR_NOT_FOUND: Byte = 0x04
 
         // Characteristic properties
         private const val PROP_READ = 0x01
@@ -47,6 +47,49 @@ class DirconServer(
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
             0x80.toByte(), 0x00, 0x00, 0x80.toByte(), 0x5F, 0x9B.toByte(), 0x34, 0xFB.toByte()
         )
+
+        internal fun uuidToBytes(short: Int): ByteArray {
+            val uuid = BLE_BASE_UUID.copyOf()
+            uuid[2] = ((short shr 8) and 0xFF).toByte()
+            uuid[3] = (short and 0xFF).toByte()
+            return uuid
+        }
+
+        internal fun uuidFromBytes(bytes: ByteArray, offset: Int = 0): Int {
+            return ((bytes[offset + 2].toInt() and 0xFF) shl 8) or (bytes[offset + 3].toInt() and 0xFF)
+        }
+    }
+
+    /** Dircon protocol packet — shared between server and tests. */
+    data class DirconPacket(
+        val msgType: Byte,
+        val seq: Int,
+        val respCode: Byte,
+        val payload: ByteArray
+    ) {
+        fun toBytes(): ByteArray {
+            val pkt = ByteArray(6 + payload.size)
+            pkt[0] = VERSION
+            pkt[1] = msgType
+            pkt[2] = seq.toByte()
+            pkt[3] = respCode
+            pkt[4] = ((payload.size shr 8) and 0xFF).toByte()
+            pkt[5] = (payload.size and 0xFF).toByte()
+            payload.copyInto(pkt, 6)
+            return pkt
+        }
+
+        companion object {
+            fun parse(bytes: ByteArray): DirconPacket {
+                val payloadLen = ((bytes[4].toInt() and 0xFF) shl 8) or (bytes[5].toInt() and 0xFF)
+                return DirconPacket(
+                    msgType = bytes[1],
+                    seq = bytes[2].toInt() and 0xFF,
+                    respCode = bytes[3],
+                    payload = if (payloadLen > 0) bytes.copyOfRange(6, 6 + payloadLen) else ByteArray(0)
+                )
+            }
+        }
     }
 
     data class TreadmillSnapshot(
@@ -166,22 +209,18 @@ class DirconServer(
     }
 
     private fun processPacket(client: ClientState, pkt: ByteArray): ByteArray? {
-        val msgType = pkt[1]
-        val seqNum = pkt[2].toInt() and 0xFF
-        val payloadLen = ((pkt[4].toInt() and 0xFF) shl 8) or (pkt[5].toInt() and 0xFF)
-        val payload = if (payloadLen > 0) pkt.copyOfRange(6, 6 + payloadLen) else ByteArray(0)
+        val req = DirconPacket.parse(pkt)
+        client.seq = req.seq
 
-        client.seq = seqNum
-
-        return when (msgType) {
-            MSG_DISCOVER_SERVICES -> handleDiscoverServices(seqNum)
-            MSG_DISCOVER_CHARS -> handleDiscoverChars(seqNum, payload)
-            MSG_READ_CHAR -> handleReadChar(seqNum, payload)
-            MSG_WRITE_CHAR -> handleWriteChar(seqNum, payload)
-            MSG_ENABLE_NOTIFY -> handleEnableNotify(client, seqNum, payload)
-            MSG_UNKNOWN_07 -> buildResponse(MSG_UNKNOWN_07, seqNum, RESP_SUCCESS, ByteArray(0))
+        return when (req.msgType) {
+            MSG_DISCOVER_SERVICES -> handleDiscoverServices(req.seq)
+            MSG_DISCOVER_CHARS -> handleDiscoverChars(req.seq, req.payload)
+            MSG_READ_CHAR -> handleReadChar(req.seq, req.payload)
+            MSG_WRITE_CHAR -> handleWriteChar(req.seq, req.payload)
+            MSG_ENABLE_NOTIFY -> handleEnableNotify(client, req.seq, req.payload)
+            MSG_UNKNOWN_07 -> respond(MSG_UNKNOWN_07, req.seq, RESP_SUCCESS, ByteArray(0))
             else -> {
-                Log.w(TAG, "Unknown msg type: $msgType")
+                Log.w(TAG, "Unknown msg type: ${req.msgType}")
                 null
             }
         }
@@ -190,14 +229,14 @@ class DirconServer(
     private fun handleDiscoverServices(seq: Int): ByteArray {
         val uuids = ByteArray(services.size * 16)
         services.forEachIndexed { i, svc -> uuidToBytes(svc.uuid).copyInto(uuids, i * 16) }
-        return buildResponse(MSG_DISCOVER_SERVICES, seq, RESP_SUCCESS, uuids)
+        return respond(MSG_DISCOVER_SERVICES, seq, RESP_SUCCESS, uuids)
     }
 
     private fun handleDiscoverChars(seq: Int, payload: ByteArray): ByteArray {
-        if (payload.size < 16) return buildResponse(MSG_DISCOVER_CHARS, seq, RESP_SERVICE_NOT_FOUND, ByteArray(0))
+        if (payload.size < 16) return respond(MSG_DISCOVER_CHARS, seq, RESP_SERVICE_NOT_FOUND, ByteArray(0))
         val svcUuid = uuidFromBytes(payload)
         val svc = services.find { it.uuid == svcUuid }
-            ?: return buildResponse(MSG_DISCOVER_CHARS, seq, RESP_SERVICE_NOT_FOUND, ByteArray(0))
+            ?: return respond(MSG_DISCOVER_CHARS, seq, RESP_SERVICE_NOT_FOUND, ByteArray(0))
 
         // Response: service UUID (16) + for each char: UUID (16) + props (1)
         val data = ByteArray(16 + svc.chars.size * 17)
@@ -206,23 +245,23 @@ class DirconServer(
             uuidToBytes(ch.uuid).copyInto(data, 16 + i * 17)
             data[16 + i * 17 + 16] = ch.props.toByte()
         }
-        return buildResponse(MSG_DISCOVER_CHARS, seq, RESP_SUCCESS, data)
+        return respond(MSG_DISCOVER_CHARS, seq, RESP_SUCCESS, data)
     }
 
     private fun handleReadChar(seq: Int, payload: ByteArray): ByteArray {
-        if (payload.size < 16) return buildResponse(MSG_READ_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
+        if (payload.size < 16) return respond(MSG_READ_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
         val charUuid = uuidFromBytes(payload)
         val charDef = services.flatMap { it.chars }.find { it.uuid == charUuid }
-            ?: return buildResponse(MSG_READ_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
+            ?: return respond(MSG_READ_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
 
         val data = ByteArray(16 + charDef.readValue.size)
         uuidToBytes(charUuid).copyInto(data, 0)
         charDef.readValue.copyInto(data, 16)
-        return buildResponse(MSG_READ_CHAR, seq, RESP_SUCCESS, data)
+        return respond(MSG_READ_CHAR, seq, RESP_SUCCESS, data)
     }
 
     private fun handleWriteChar(seq: Int, payload: ByteArray): ByteArray {
-        if (payload.size < 16) return buildResponse(MSG_WRITE_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
+        if (payload.size < 16) return respond(MSG_WRITE_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
         val charUuid = uuidFromBytes(payload)
         val writeData = if (payload.size > 16) payload.copyOfRange(16, payload.size) else ByteArray(0)
 
@@ -240,17 +279,17 @@ class DirconServer(
             indication[16] = 0x80.toByte()
             indication[17] = opcode.toByte()
             indication[18] = if (ok) 0x01 else 0x02
-            return buildResponse(MSG_WRITE_CHAR, seq, RESP_SUCCESS, indication)
+            return respond(MSG_WRITE_CHAR, seq, RESP_SUCCESS, indication)
         }
 
         // Generic write response
         val respData = ByteArray(16)
         uuidToBytes(charUuid).copyInto(respData, 0)
-        return buildResponse(MSG_WRITE_CHAR, seq, RESP_SUCCESS, respData)
+        return respond(MSG_WRITE_CHAR, seq, RESP_SUCCESS, respData)
     }
 
     private fun handleEnableNotify(client: ClientState, seq: Int, payload: ByteArray): ByteArray {
-        if (payload.size < 16) return buildResponse(MSG_ENABLE_NOTIFY, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
+        if (payload.size < 16) return respond(MSG_ENABLE_NOTIFY, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
         val charUuid = uuidFromBytes(payload)
         val enable = payload.size >= 17 && payload[16].toInt() != 0
 
@@ -264,7 +303,7 @@ class DirconServer(
 
         val respData = ByteArray(16)
         uuidToBytes(charUuid).copyInto(respData, 0)
-        return buildResponse(MSG_ENABLE_NOTIFY, seq, RESP_SUCCESS, respData)
+        return respond(MSG_ENABLE_NOTIFY, seq, RESP_SUCCESS, respData)
     }
 
     private fun pushNotifications() {
@@ -281,7 +320,7 @@ class DirconServer(
                     uuidToBytes(0x2ACD).copyInto(payload, 0)
                     treadmillData.copyInto(payload, 16)
 
-                    val pkt = buildResponse(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload)
+                    val pkt = respond(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload)
                     synchronized(client.output) {
                         client.output.write(pkt)
                         client.output.flush()
@@ -294,7 +333,7 @@ class DirconServer(
                     uuidToBytes(0x2A37).copyInto(payload, 0)
                     hrData.copyInto(payload, 16)
 
-                    val pkt = buildResponse(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload)
+                    val pkt = respond(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload)
                     synchronized(client.output) {
                         client.output.write(pkt)
                         client.output.flush()
@@ -308,26 +347,7 @@ class DirconServer(
 
     // --- Helpers ---
 
-    private fun buildResponse(msgType: Byte, seq: Int, respCode: Byte, payload: ByteArray): ByteArray {
-        val pkt = ByteArray(6 + payload.size)
-        pkt[0] = VERSION
-        pkt[1] = msgType
-        pkt[2] = seq.toByte()
-        pkt[3] = respCode
-        pkt[4] = ((payload.size shr 8) and 0xFF).toByte()
-        pkt[5] = (payload.size and 0xFF).toByte()
-        payload.copyInto(pkt, 6)
-        return pkt
-    }
+    private fun respond(msgType: Byte, seq: Int, respCode: Byte, payload: ByteArray): ByteArray =
+        DirconPacket(msgType, seq, respCode, payload).toBytes()
 
-    private fun uuidToBytes(short: Int): ByteArray {
-        val uuid = BLE_BASE_UUID.copyOf()
-        uuid[2] = ((short shr 8) and 0xFF).toByte()
-        uuid[3] = (short and 0xFF).toByte()
-        return uuid
-    }
-
-    private fun uuidFromBytes(bytes: ByteArray, offset: Int = 0): Int {
-        return ((bytes[offset + 2].toInt() and 0xFF) shl 8) or (bytes[offset + 3].toInt() and 0xFF)
-    }
 }

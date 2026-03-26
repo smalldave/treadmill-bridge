@@ -1,13 +1,8 @@
 package com.treadmill.bridge
 
-import android.hardware.usb.UsbDeviceConnection
-import android.hardware.usb.UsbEndpoint
-import android.hardware.usb.UsbRequest
 import android.util.Log
-import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 /**
@@ -17,14 +12,11 @@ import kotlin.concurrent.thread
  * Protocol: docs/projects/fitpro1-protocol.md
  */
 class FitPro1(
-    private val connection: UsbDeviceConnection,
-    private val writeEndpoint: UsbEndpoint,
-    private val readEndpoint: UsbEndpoint
+    private val transport: UsbTransport
 ) {
     companion object {
         private const val TAG = "FitPro1"
         private const val HANDSHAKE_SIZE = 64
-        private const val USB_TIMEOUT_MS = 50
         private const val MAX_READ_RETRIES = 5
         private const val DEVICE_MAIN: Byte = 2
         private const val CMD_STATUS_DONE = 2
@@ -83,7 +75,7 @@ class FitPro1(
     @Volatile var lastSnapshot = DirconServer.TreadmillSnapshot()
         private set
 
-    private var running = false
+    @Volatile private var running = false
     private var distanceM = 0.0
     private var startTimeMs = 0L
     private var lastPollMs = System.currentTimeMillis()
@@ -95,14 +87,9 @@ class FitPro1(
         val buf = ByteArray(HANDSHAKE_SIZE) { 0xFF.toByte() }
         var consecutive = 0; var attempts = 0
         while (consecutive < 2 && attempts < 10) {
-            val wr = UsbRequest(); wr.initialize(connection, writeEndpoint)
-            if (!wr.queue(ByteBuffer.wrap(buf), HANDSHAKE_SIZE)) { wr.close(); attempts++; Thread.sleep(500); continue }
-            connection.requestWait(); wr.close()
-            val rr = UsbRequest(); rr.initialize(connection, readEndpoint)
-            val rb = ByteBuffer.allocate(HANDSHAKE_SIZE)
-            if (!rr.queue(rb, HANDSHAKE_SIZE)) { rr.close(); attempts++; Thread.sleep(500); continue }
-            connection.requestWait(); rr.close()
-            val reply = ByteArray(HANDSHAKE_SIZE); rb.position(0); rb.get(reply)
+            if (!transport.write(buf)) { attempts++; Thread.sleep(500); continue }
+            val reply = ByteArray(HANDSHAKE_SIZE)
+            if (transport.read(reply) < 0) { attempts++; Thread.sleep(500); continue }
             val ok = reply.indices.all { i -> i == 3 || reply[i] == 0xFF.toByte() }
             if (ok) { consecutive++; Log.d(TAG, "handshake ok ($consecutive/2)") }
             else { consecutive = 0; Log.d(TAG, "handshake mismatch") }
@@ -138,7 +125,10 @@ class FitPro1(
         secContent[34] = ((secretKey shr 16) and 0xFF).toByte()
         secContent[35] = ((secretKey shr 24) and 0xFF).toByte()
         val secResp = sendCommandDirect(buildCmd(CMD_VERIFY_SECURITY, secContent), "init:Security", 300)
-        Log.d(TAG, "Security: ${if ((secResp?.get(3)?.toInt()?.and(0xFF) ?: -1) == CMD_STATUS_DONE) "UNLOCKED" else "FAILED"}")
+        if ((secResp?.get(3)?.toInt()?.and(0xFF) ?: -1) != CMD_STATUS_DONE) {
+            Log.e(TAG, "Security verification FAILED"); return false
+        }
+        Log.d(TAG, "Security: UNLOCKED")
         Thread.sleep(200)
 
         Log.d(TAG, "=== Unlock console ===")
@@ -282,14 +272,14 @@ class FitPro1(
     /** Low-level USB write+read. Called ONLY from USB thread or init. */
     private fun sendAndRead(request: ByteArray, label: String, readDelayMs: Long): ByteArray? {
         Log.d(TAG, "$label TX: ${request.joinToString(" ") { "%02X".format(it) }}")
-        if (connection.bulkTransfer(writeEndpoint, request, request.size, USB_TIMEOUT_MS) < 0) {
+        if (!transport.write(request)) {
             Log.e(TAG, "$label write failed"); return null
         }
         Thread.sleep(readDelayMs)
 
         val buf = ByteArray(64); var retries = 0
         while (retries < MAX_READ_RETRIES) {
-            if (connection.bulkTransfer(readEndpoint, buf, 64, USB_TIMEOUT_MS) < 0) {
+            if (transport.read(buf) < 0) {
                 Log.e(TAG, "$label read failed"); return null
             }
             if (buf[0] != 0xFF.toByte()) break

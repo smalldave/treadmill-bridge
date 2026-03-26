@@ -80,7 +80,15 @@ class MainActivity : Activity() {
         status("Handshaking...")
 
         Thread {
-            val fp = FitPro1(connection, intf.getEndpoint(1), intf.getEndpoint(0))
+            val writeEp = intf.getEndpoint(1)
+            val readEp = intf.getEndpoint(0)
+            val transport = object : UsbTransport {
+                override fun write(data: ByteArray) =
+                    connection.bulkTransfer(writeEp, data, data.size, 50) >= 0
+                override fun read(buf: ByteArray) =
+                    connection.bulkTransfer(readEp, buf, buf.size, 50)
+            }
+            val fp = FitPro1(transport)
             if (!fp.handshake()) { handler.post { status("Handshake FAILED") }; return@Thread }
             handler.post { status("Initializing...") }
 
