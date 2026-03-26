@@ -23,6 +23,8 @@ class MainActivity : Activity() {
     }
 
     private lateinit var statusText: TextView
+    private lateinit var metricsText: TextView
+    private lateinit var statsText: TextView
     private var fitPro1: FitPro1? = null
     private var dirconServer: DirconServer? = null
     private var mdnsAdvertiser: MdnsAdvertiser? = null
@@ -36,17 +38,19 @@ class MainActivity : Activity() {
                 val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
                 val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
                 if (granted && device != null) connectToDevice(device)
-                else status("USB permission denied")
+                else status("USB permission denied", getColor(R.color.status_red))
             }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        statusText = TextView(this).apply { textSize = 18f; setPadding(32, 32, 32, 32) }
-        setContentView(statusText)
+        setContentView(R.layout.activity_main)
+        statusText = findViewById(R.id.statusText)
+        metricsText = findViewById(R.id.metricsText)
+        statsText = findViewById(R.id.statsText)
         registerReceiver(usbReceiver, IntentFilter(ACTION_USB_PERMISSION))
-        status("Looking for motor controller...")
+        status("Looking for motor controller…")
         findAndConnect()
     }
 
@@ -61,7 +65,7 @@ class MainActivity : Activity() {
     private fun findAndConnect() {
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
         val device = usbManager.deviceList.values.firstOrNull { it.vendorId == 8508 && it.productId == 2 }
-        if (device == null) { status("No motor controller found"); return }
+        if (device == null) { status("No motor controller found", getColor(R.color.status_red)); return }
         if (usbManager.hasPermission(device)) connectToDevice(device)
         else {
             usbManager.requestPermission(device,
@@ -72,10 +76,10 @@ class MainActivity : Activity() {
 
     private fun connectToDevice(device: UsbDevice) {
         val usbManager = getSystemService(USB_SERVICE) as UsbManager
-        val connection = usbManager.openDevice(device) ?: run { status("Failed to open USB"); return }
+        val connection = usbManager.openDevice(device) ?: run { status("Failed to open USB", getColor(R.color.status_red)); return }
         val intf = device.getInterface(0)
         connection.claimInterface(intf, true)
-        if (intf.endpointCount < 2) { status("Need 2 endpoints"); return }
+        if (intf.endpointCount < 2) { status("Need 2 endpoints", getColor(R.color.status_red)); return }
 
         status("Handshaking...")
 
@@ -89,7 +93,7 @@ class MainActivity : Activity() {
                     connection.bulkTransfer(readEp, buf, buf.size, 50)
             }
             val fp = FitPro1(transport)
-            if (!fp.handshake()) { handler.post { status("Handshake FAILED") }; return@Thread }
+            if (!fp.handshake()) { handler.post { status("Handshake FAILED", getColor(R.color.status_red)) }; return@Thread }
             handler.post { status("Initializing...") }
 
             fp.initialize()
@@ -102,8 +106,10 @@ class MainActivity : Activity() {
                 val elapsed = if (fp.lastSnapshot.elapsedSec > 0) fp.lastSnapshot.elapsedSec else 0
                 val modeName = fp.workoutModeName(state.workoutMode)
                 handler.post {
-                    status("Speed: %.1f km/h  Incline: %.1f%%\nMode: $modeName  Dist: %dm  Time: %ds\nStart: ${state.startRequested}  Zwift: $clients\n\nReads: $readCount  Errors: $errorCount"
-                        .format(state.speedKPH, state.inclinePct, fp.lastSnapshot.distanceM, elapsed))
+                    metricsText.text = "Speed:   %.1f km/h\nIncline: %.1f%%\nMode:    %s\nDist:    %dm\nTime:    %ds\nStart:   %s\nZwift:   %d client%s"
+                        .format(state.speedKPH, state.inclinePct, modeName, fp.lastSnapshot.distanceM, elapsed,
+                            if (state.startRequested) "yes" else "no", clients, if (clients != 1) "s" else "")
+                    statsText.text = "Reads: $readCount  Errors: $errorCount"
                 }
             }
 
@@ -118,7 +124,7 @@ class MainActivity : Activity() {
 
             handler.post {
                 startMdns()
-                status("Ready — Dircon :$DIRCON_PORT")
+                status("Ready — Dircon :$DIRCON_PORT", getColor(R.color.status_green))
             }
         }.start()
     }
@@ -166,5 +172,9 @@ class MainActivity : Activity() {
         mdnsAdvertiser = MdnsAdvertiser(this, "Treadmill Bridge", DIRCON_PORT, ipBytes, mac).also { it.start() }
     }
 
-    private fun status(msg: String) { Log.d(TAG, msg); statusText.text = msg }
+    private fun status(msg: String, color: Int = getColor(R.color.status_yellow)) {
+        Log.d(TAG, msg)
+        statusText.text = msg
+        statusText.setTextColor(color)
+    }
 }
