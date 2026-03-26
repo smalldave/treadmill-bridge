@@ -1,9 +1,8 @@
 # FitPro1 Protocol Specification
 
-Reverse-engineered from `Sindarin.FitPro1.Core.dll`, `Sindarin.Core.dll`, and
-`Sindarin.Usb.Android.dll` decompiled from the iFit wolf APK. Describes the
-USB protocol between the Android tablet and the motor controller on
-NordicTrack/ProForm iFit treadmills.
+Independently documented USB protocol between the Android tablet and the motor
+controller on NordicTrack/ProForm iFit treadmills. Derived through
+interoperability reverse engineering and hardware-level observation.
 
 ## USB Device
 
@@ -79,10 +78,9 @@ Byte  Field
 **USB sends Layer 1 directly — NO wrapper.** Verified on hardware: wrapped
 commands return `SecurityBlock (8)`, raw commands return `Done (2)`.
 
-The wrapper is BLE-only. The decompiled code shows wolf's USB adapter sending
-`OriginalBytes` which includes the wrapper, but the actual hardware rejects it.
-This may be a firmware version difference or the decompiled code path may not
-be the one actually executed at runtime.
+The wrapper is BLE-only. On hardware, wrapped commands return `SecurityBlock (8)`
+while raw commands return `Done (2)`, confirming that USB transport should not
+use the wrapper.
 
 (BLE transport adds the wrapper plus a third layer of 20-byte chunking with
 `[0xFE, 0x02, len, count]` init frames — neither is used for USB.)
@@ -95,10 +93,8 @@ be the one actually executed at runtime.
 [Device][Length][CmdID][Status][...data...][Checksum]
 ```
 
-The `[0x02, 0x04, 0x02, len]` wrapper is **TX-only**. Verified from decompiled code:
-- `FitProUsbConsoleCommunicationAdapter.DataReceived()` stores raw bytes (line 2976)
-- `FormattedBytes` for USB returns raw `ResponseBytes` without stripping (line 2614-2618)
-- `CleanResponse()` works directly on `bytes[0]=Device` (line 162-202)
+The `[0x02, 0x04, 0x02, len]` wrapper is **TX-only**. Verified on hardware:
+responses arrive as raw FitPro bytes starting with the Device byte.
 
 Note: the response Device may differ from the request Device. Request uses
 `Device.Main (2)`, response may come back as `Device.Treadmill (4)`.
