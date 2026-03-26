@@ -103,16 +103,19 @@ class FitPro1(
     fun initialize(): Boolean {
         Log.d(TAG, "=== DeviceInfo ===")
         val diResp = sendCommandDirect(buildCmd(CMD_DEVICE_INFO), "init:DeviceInfo", 300) ?: return false
-        if ((diResp[3].toInt() and 0xFF) != CMD_STATUS_DONE) { Log.e(TAG, "DeviceInfo failed"); return false }
-        val masterLibVer = diResp[4].toInt() and 0xFF
-        val serialNumber = u32(diResp, 6)
+        if (!isSuccess(diResp)) { Log.e(TAG, "DeviceInfo failed"); return false }
+        val di = diResp.asLEBuffer().apply { position(4) }
+        val masterLibVer = di.readU8()
+        di.readU8() // padding
+        val serialNumber = di.readS32()
         Log.d(TAG, "swVer=$masterLibVer serial=$serialNumber")
         Thread.sleep(200)
 
         Log.d(TAG, "=== SystemInfo ===")
         val siResp = sendCommandDirect(buildCmd(CMD_SYSTEM_INFO, byteArrayOf(0, 0)), "init:SystemInfo", 300) ?: return false
-        if ((siResp[3].toInt() and 0xFF) != CMD_STATUS_DONE) { Log.e(TAG, "SystemInfo failed"); return false }
-        val model = u32(siResp, 7); val partNumber = u32(siResp, 11)
+        if (!isSuccess(siResp)) { Log.e(TAG, "SystemInfo failed"); return false }
+        val si = siResp.asLEBuffer().apply { position(7) }
+        val model = si.readS32(); val partNumber = si.readS32()
         Log.d(TAG, "model=$model partNumber=$partNumber")
         Thread.sleep(200)
 
@@ -166,12 +169,12 @@ class FitPro1(
 
                     // Parse result and update snapshot
                     val resp = pollCmd.future.getNow(null)
-                    if (resp != null && (resp[3].toInt() and 0xFF) == CMD_STATUS_DONE) {
-                        var off = 4
-                        val speedKPH = u16(resp, off) / 100.0; off += 2
-                        val mode = resp[off].toInt() and 0xFF; off += 1
-                        val inclinePct = u16s(resp, off) / 100.0; off += 2
-                        val startReq = resp[off].toInt() != 0
+                    if (resp != null && isSuccess(resp)) {
+                        val buf = resp.asLEBuffer().apply { position(4) }
+                        val speedKPH = buf.readU16() / 100.0
+                        val mode = buf.readU8()
+                        val inclinePct = buf.readS16() / 100.0
+                        val startReq = buf.readU8() != 0
                         val state = TreadmillState(speedKPH, inclinePct, mode, startReq)
                         handlePollCycle(state)
                         lastSnapshot = DirconServer.TreadmillSnapshot(
@@ -330,11 +333,6 @@ class FitPro1(
         val len = bytes[1].toInt() and 0xFF; var sum = 0
         for (i in 0 until len - 1) sum += bytes[i].toInt() and 0xFF; return sum.toByte()
     }
-
-    private fun u16(b: ByteArray, o: Int) = (b[o].toInt() and 0xFF) or ((b[o+1].toInt() and 0xFF) shl 8)
-    private fun u16s(b: ByteArray, o: Int) = u16(b, o).toShort().toDouble()
-    private fun u32(b: ByteArray, o: Int) = (b[o].toInt() and 0xFF) or ((b[o+1].toInt() and 0xFF) shl 8) or
-            ((b[o+2].toInt() and 0xFF) shl 16) or ((b[o+3].toInt() and 0xFF) shl 24)
 
     private fun statusName(s: Int) = when(s) {
         0->"DevNotSupported"; 1->"CmdNotSupported"; 2->"Done"; 3->"InProgress"

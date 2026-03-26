@@ -108,35 +108,37 @@ object DnsPacket {
     /** Parse an mDNS response packet into a list of records. */
     fun parseResponse(bytes: ByteArray): List<DnsRecord> {
         val len = bytes.size
-        val anCount = u16(bytes, 6)
-        var off = 12 // skip header
+        val buf = bytes.asBEBuffer()
+        buf.position(6)
+        val anCount = buf.readU16()
+        buf.position(12) // skip rest of header
 
         val records = mutableListOf<DnsRecord>()
         for (i in 0 until anCount) {
-            val (name, nameLen) = parseName(bytes, off, len)
-            off += nameLen
-            val type = u16(bytes, off); off += 2
-            off += 2 // class
-            val ttl = u32(bytes, off); off += 4
-            val rdLength = u16(bytes, off); off += 2
-            val rdStart = off
+            val (name, nameLen) = parseName(bytes, buf.position(), len)
+            buf.position(buf.position() + nameLen)
+            val type = buf.readU16()
+            buf.readU16() // class
+            val ttl = buf.readS32()
+            val rdLength = buf.readU16()
+            val rdStart = buf.position()
 
             when (type.toShort()) {
                 TYPE_PTR -> {
-                    val (target, _) = parseName(bytes, off, len)
+                    val (target, _) = parseName(bytes, buf.position(), len)
                     records.add(DnsRecord.Ptr(name, ttl, target))
                 }
                 TYPE_SRV -> {
-                    val priority = u16(bytes, off)
-                    val weight = u16(bytes, off + 2)
-                    val port = u16(bytes, off + 4)
-                    val (target, _) = parseName(bytes, off + 6, len)
+                    val priority = buf.readU16()
+                    val weight = buf.readU16()
+                    val port = buf.readU16()
+                    val (target, _) = parseName(bytes, buf.position(), len)
                     records.add(DnsRecord.Srv(name, ttl, priority, weight, port, target))
                 }
                 TYPE_TXT -> {
                     val entries = mutableListOf<String>()
-                    var pos = off
-                    while (pos < off + rdLength) {
+                    var pos = buf.position()
+                    while (pos < rdStart + rdLength) {
                         val entryLen = bytes[pos].toInt() and 0xFF
                         entries.add(String(bytes, pos + 1, entryLen))
                         pos += 1 + entryLen
@@ -144,11 +146,11 @@ object DnsPacket {
                     records.add(DnsRecord.Txt(name, ttl, entries))
                 }
                 TYPE_A -> {
-                    records.add(DnsRecord.A(name, ttl, bytes.copyOfRange(off, off + 4)))
+                    records.add(DnsRecord.A(name, ttl, bytes.copyOfRange(buf.position(), buf.position() + 4)))
                 }
             }
 
-            off = rdStart + rdLength
+            buf.position(rdStart + rdLength)
         }
         return records
     }
@@ -237,10 +239,4 @@ object DnsPacket {
         return bos2.toByteArray()
     }
 
-    private fun u16(buf: ByteArray, off: Int): Int =
-        ((buf[off].toInt() and 0xFF) shl 8) or (buf[off + 1].toInt() and 0xFF)
-
-    private fun u32(buf: ByteArray, off: Int): Int =
-        ((buf[off].toInt() and 0xFF) shl 24) or ((buf[off + 1].toInt() and 0xFF) shl 16) or
-        ((buf[off + 2].toInt() and 0xFF) shl 8) or (buf[off + 3].toInt() and 0xFF)
 }
