@@ -1,15 +1,16 @@
 package com.treadmill.bridge
 
 import android.util.Log
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.ConcurrentLinkedQueue
-import kotlin.concurrent.thread
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 
 /**
  * FitPro1 protocol for NordicTrack/iFit treadmills.
- * Single USB thread — all access serialized through command queue.
+ * Single USB thread — all access serialized through command channel.
  *
- * Protocol: docs/projects/fitpro1-protocol.md
+ * Protocol: docs/fitpro1-protocol.md
  */
 class FitPro1(
     private val transport: UsbTransport
@@ -41,24 +42,26 @@ class FitPro1(
         const val MIN_SPEED_KPH = 1.6
     }
 
-    // ========== Command Queue ==========
+    // ========== Command Channel ==========
 
     data class UsbCommand(
         val request: ByteArray,
         val readDelayMs: Long = 80,
         val label: String = "",
         val callerTrace: Throwable = Throwable("enqueued at"),
-        val future: CompletableFuture<ByteArray?> = CompletableFuture()
+        val deferred: CompletableDeferred<ByteArray?> = CompletableDeferred()
     )
 
-    private val commandQueue = ConcurrentLinkedQueue<UsbCommand>()
-    private var usbLoopRunning = false
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val usbDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private val commandChannel = Channel<UsbCommand>(Channel.BUFFERED)
+    private var usbScope: CoroutineScope? = null
 
-    /** Enqueue a command for USB execution. Returns future with response. */
-    fun enqueue(request: ByteArray, readDelayMs: Long = 80, label: String = ""): CompletableFuture<ByteArray?> {
+    /** Enqueue a command for USB execution. Returns deferred with response. */
+    fun enqueue(request: ByteArray, readDelayMs: Long = 80, label: String = ""): Deferred<ByteArray?> {
         val cmd = UsbCommand(request, readDelayMs, label)
-        commandQueue.add(cmd)
-        return cmd.future
+        commandChannel.trySend(cmd)
+        return cmd.deferred
     }
 
     // ========== Shared State ==========
@@ -72,8 +75,8 @@ class FitPro1(
         20->"PauseOverride"; else->"?($mode)"
     }
 
-    @Volatile var lastSnapshot = DirconServer.TreadmillSnapshot()
-        private set
+    private val _snapshotFlow = MutableStateFlow(DirconServer.TreadmillSnapshot())
+    val snapshotFlow: StateFlow<DirconServer.TreadmillSnapshot> get() = _snapshotFlow
 
     @Volatile private var running = false
     private var distanceM = 0.0
@@ -143,81 +146,85 @@ class FitPro1(
     // ========== USB Loop (single thread — all runtime USB access here) ==========
 
     fun startUsbLoop() {
-        usbLoopRunning = true
-        thread(name = "usb-loop") {
+        val scope = CoroutineScope(usbDispatcher + SupervisorJob())
+        usbScope = scope
+
+        // Command drain — suspends when no commands (no spin-wait)
+        scope.launch {
+            for (cmd in commandChannel) {
+                executeCommand(cmd)
+            }
+        }
+
+        // Poll cycle — fixed 500ms interval
+        scope.launch {
             Log.d(TAG, "USB loop started")
-            var lastPollEnqueueMs = 0L
-
-            while (usbLoopRunning) {
-                // Drain command queue
-                var cmd = commandQueue.poll()
-                if (cmd != null) {
-                    executeCommand(cmd)
-                } else {
-                    Thread.sleep(10) // Don't spin
-                }
-
-                // Enqueue periodic read every POLL_INTERVAL_MS
-                val now = System.currentTimeMillis()
-                if (now - lastPollEnqueueMs >= POLL_INTERVAL_MS) {
-                    lastPollEnqueueMs = now
-                    // Read: Kph(0), WorkoutMode(12), ActualIncline(17), StartRequested(96)
-                    // Data order: Kph(2) + WorkoutMode(1) + ActualIncline(2) + StartRequested(1) = 6 bytes
-                    val readReq = buildReadRequest(listOf(BF_KPH, BF_WORKOUT_MODE, BF_ACTUAL_INCLINE, BF_START_REQUESTED))
-                    val pollCmd = UsbCommand(readReq, 80, "poll")
-                    executeCommand(pollCmd)
-
-                    // Parse result and update snapshot
-                    val resp = pollCmd.future.getNow(null)
-                    if (resp != null && isSuccess(resp)) {
-                        val buf = resp.asLEBuffer().apply { position(4) }
-                        val speedKPH = buf.readU16() / 100.0
-                        val mode = buf.readU8()
-                        val inclinePct = buf.readS16() / 100.0
-                        val startReq = buf.readU8() != 0
-                        val state = TreadmillState(speedKPH, inclinePct, mode, startReq)
-                        handlePollCycle(state)
-                        lastSnapshot = DirconServer.TreadmillSnapshot(
-                            state.speedKPH, state.inclinePct, 0, distanceM.toInt(),
-                            if (startTimeMs > 0) ((now - startTimeMs) / 1000).toInt() else 0
-                        )
-                        onStateUpdate?.invoke(state)
-                    }
-                }
+            while (isActive) {
+                doPoll()
+                delay(POLL_INTERVAL_MS)
             }
             Log.d(TAG, "USB loop stopped")
         }
     }
 
-    fun stopUsbLoop() { usbLoopRunning = false }
+    fun stopUsbLoop() {
+        usbScope?.cancel()
+        usbScope = null
+    }
+
+    private fun doPoll() {
+        val readReq = buildReadRequest(listOf(BF_KPH, BF_WORKOUT_MODE, BF_ACTUAL_INCLINE, BF_START_REQUESTED))
+        val resp = sendAndRead(readReq, "poll", 80) ?: return
+        if (!isSuccess(resp)) return
+
+        // Poll response: header(4) + speed(2) + mode(1) + incline(2) + startReq(1) = 10 bytes min
+        if (resp.size < 10) return
+        val buf = resp.asLEBuffer().apply { position(4) }
+        val speedKPH = buf.readU16() / 100.0
+        val mode = buf.readU8()
+        val inclinePct = buf.readS16() / 100.0
+        val startReq = buf.readU8() != 0
+        val state = TreadmillState(speedKPH, inclinePct, mode, startReq)
+        handlePollCycle(state)
+
+        val now = System.currentTimeMillis()
+        _snapshotFlow.value = DirconServer.TreadmillSnapshot(
+            state.speedKPH, state.inclinePct, 0, distanceM.toInt(),
+            if (startTimeMs > 0) ((now - startTimeMs) / 1000).toInt() else 0
+        )
+        onStateUpdate?.invoke(state)
+    }
 
     private fun executeCommand(cmd: UsbCommand) {
         try {
             val response = sendAndRead(cmd.request, cmd.label, cmd.readDelayMs)
-            cmd.future.complete(response)
+            cmd.deferred.complete(response)
             if (response == null) {
                 Log.w(TAG, "${cmd.label}: no response", cmd.callerTrace)
             }
         } catch (e: Exception) {
             Log.e(TAG, "${cmd.label}: USB error", e)
             Log.e(TAG, "${cmd.label}: enqueued from:", cmd.callerTrace)
-            cmd.future.complete(null)
+            cmd.deferred.complete(null)
         }
     }
 
-    // ========== Public API (non-blocking, enqueue + return future) ==========
+    // ========== Public API (non-blocking, enqueue + return deferred) ==========
 
-    fun setSpeed(kph: Double): CompletableFuture<Boolean> {
+    fun setSpeed(kph: Double): Deferred<Boolean> {
         val req = buildWriteU16Cmd(BF_KPH, (kph * 100).toInt())
-        return enqueue(req, label = "setSpeed($kph)").thenApply { isSuccess(it) }
+        return enqueueAndMap(req, "setSpeed($kph)")
     }
 
-    fun setIncline(pct: Double): CompletableFuture<Boolean> {
+    fun setIncline(pct: Double): Deferred<Boolean> {
         val req = buildWriteU16Cmd(BF_GRADE, (pct * 100).toInt())
-        return enqueue(req, label = "setIncline($pct)").thenApply { isSuccess(it) }
+        return enqueueAndMap(req, "setIncline($pct)")
     }
 
-    fun startWorkout(speedKPH: Double, inclinePct: Double): CompletableFuture<Boolean> {
+    fun startWorkout(speedKPH: Double, inclinePct: Double): Deferred<Boolean> {
+        if (!running) {
+            running = true; startTimeMs = System.currentTimeMillis(); distanceM = 0.0
+        }
         val speedRaw = (speedKPH * 100).toInt()
         val inclineRaw = (inclinePct * 100).toInt()
         val content = byteArrayOf(
@@ -226,13 +233,24 @@ class FitPro1(
             (inclineRaw and 0xFF).toByte(), ((inclineRaw shr 8) and 0xFF).toByte(),
             WORKOUT_MODE_RUNNING.toByte(), 0
         )
-        return enqueue(buildCmd(CMD_READ_WRITE_DATA, content), label = "startWorkout").thenApply { isSuccess(it) }
+        return enqueueAndMap(buildCmd(CMD_READ_WRITE_DATA, content), "startWorkout")
     }
 
-    fun stopWorkout(): CompletableFuture<Boolean> {
+    fun stopWorkout(): Deferred<Boolean> {
         val content = byteArrayOf(2, 0x00, 0x10, WORKOUT_MODE_IDLE.toByte(), 0)
         running = false
-        return enqueue(buildCmd(CMD_READ_WRITE_DATA, content), label = "stopWorkout").thenApply { isSuccess(it) }
+        return enqueueAndMap(buildCmd(CMD_READ_WRITE_DATA, content), "stopWorkout")
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun enqueueAndMap(request: ByteArray, label: String): Deferred<Boolean> {
+        val cmd = UsbCommand(request, label = label)
+        commandChannel.trySend(cmd)
+        val result = CompletableDeferred<Boolean>()
+        cmd.deferred.invokeOnCompletion {
+            result.complete(isSuccess(cmd.deferred.getCompleted()))
+        }
+        return result
     }
 
     private fun isSuccess(resp: ByteArray?): Boolean =
@@ -246,7 +264,10 @@ class FitPro1(
         lastPollMs = now
         if (state.speedKPH > 0) distanceM += (state.speedKPH / 3.6) * dtSec
 
-        // Auto-dismiss Results mode → return to Idle
+        // Auto-dismiss Results mode → return to Idle.
+        // Note: stopWorkout()/startWorkout() enqueue via commandChannel.trySend().
+        // The command drain coroutine shares this single-threaded dispatcher, so
+        // enqueued commands are processed on a subsequent poll cycle, not inline.
         if (state.workoutMode == 4) { // Results
             Log.d(TAG, "Results mode — dismissing to Idle")
             stopWorkout()
@@ -254,8 +275,7 @@ class FitPro1(
 
         if (state.startRequested && !running) {
             Log.d(TAG, "START pressed")
-            startWorkout(MIN_SPEED_KPH, state.inclinePct) // enqueues, processed next cycle
-            running = true; startTimeMs = System.currentTimeMillis(); distanceM = 0.0
+            startWorkout(MIN_SPEED_KPH, state.inclinePct)
         } else if (!state.startRequested && running && state.speedKPH == 0.0) {
             Log.d(TAG, "Stopped"); running = false
         }
@@ -332,11 +352,6 @@ class FitPro1(
     private fun checksum(bytes: ByteArray): Byte {
         val len = bytes[1].toInt() and 0xFF; var sum = 0
         for (i in 0 until len - 1) sum += bytes[i].toInt() and 0xFF; return sum.toByte()
-    }
-
-    private fun statusName(s: Int) = when(s) {
-        0->"DevNotSupported"; 1->"CmdNotSupported"; 2->"Done"; 3->"InProgress"
-        4->"Failed"; 8->"SecurityBlock"; 9->"CommFailed"; else->"Unknown($s)"
     }
 
     private fun calcSecurityHash(serial: Int, part: Int, model: Int): ByteArray {

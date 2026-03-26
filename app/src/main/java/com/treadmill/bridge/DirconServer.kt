@@ -1,12 +1,13 @@
 package com.treadmill.bridge
 
 import android.util.Log
-import java.io.InputStream
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
-import kotlin.concurrent.thread
 
 /**
  * Dircon (Wahoo Direct Connect) TCP server.
@@ -60,13 +61,29 @@ class DirconServer(
         }
     }
 
-    /** Dircon protocol packet — shared between server and tests. */
+    /** Dircon protocol packet — shared between server and tests.
+     *  Note: payload is ByteArray so auto-generated equals/hashCode compare by reference. */
     data class DirconPacket(
         val msgType: Byte,
         val seq: Int,
         val respCode: Byte,
         val payload: ByteArray
     ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is DirconPacket) return false
+            return msgType == other.msgType && seq == other.seq &&
+                respCode == other.respCode && payload.contentEquals(other.payload)
+        }
+
+        override fun hashCode(): Int {
+            var result = msgType.hashCode()
+            result = 31 * result + seq
+            result = 31 * result + respCode.hashCode()
+            result = 31 * result + payload.contentHashCode()
+            return result
+        }
+
         fun toBytes(): ByteArray {
             val pkt = ByteArray(6 + payload.size)
             pkt[0] = VERSION
@@ -122,62 +139,75 @@ class DirconServer(
     )
 
     private val clients = CopyOnWriteArrayList<ClientState>()
-    private var running = false
-    var onControlCommand: ((opcode: Int, params: ByteArray) -> Boolean)? = null
+    private var scope: CoroutineScope? = null
+    private var serverSocket: ServerSocket? = null
+    var onControlCommand: (suspend (opcode: Int, params: ByteArray) -> Boolean)? = null
 
     class ClientState(
         val socket: Socket,
         val output: OutputStream,
         var seq: Int = 0,
-        val notifyUuids: MutableList<Int> = mutableListOf()
+        val notifyUuids: MutableList<Int> = CopyOnWriteArrayList(),
+        val outputMutex: Mutex = Mutex()
     )
 
     fun start() {
-        running = true
-        thread(name = "dircon-accept") {
+        val s = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scope = s
+
+        // Accept loop
+        s.launch {
             try {
-                val server = ServerSocket(port)
+                val ss = ServerSocket(port)
+                serverSocket = ss
                 Log.d(TAG, "Listening on TCP :$port")
-                while (running) {
-                    val socket = server.accept()
-                    Log.d(TAG, "Client connected: ${socket.inetAddress}")
-                    val client = ClientState(socket, socket.getOutputStream())
-                    clients.add(client)
-                    thread(name = "dircon-client") { handleClient(client) }
+                try {
+                    while (isActive) {
+                        val socket = ss.accept()
+                        Log.d(TAG, "Client connected: ${socket.inetAddress}")
+                        val client = ClientState(socket, socket.getOutputStream())
+                        clients.add(client)
+                        launch { handleClient(client) }
+                    }
+                } finally {
+                    ss.close()
                 }
             } catch (e: Exception) {
-                if (running) Log.e(TAG, "Server error", e)
+                if (isActive) Log.e(TAG, "Server error", e)
             }
         }
 
         // Notification push loop
-        thread(name = "dircon-notify") {
-            while (running) {
+        s.launch {
+            while (isActive) {
                 try {
                     pushNotifications()
                 } catch (e: Exception) {
                     Log.e(TAG, "Notify error", e)
                 }
-                Thread.sleep(250)
+                delay(250)
             }
         }
     }
 
     fun stop() {
-        running = false
+        scope?.cancel()
+        scope = null
+        serverSocket?.close()
+        serverSocket = null
         clients.forEach { it.socket.close() }
         clients.clear()
     }
 
     val clientCount get() = clients.size
 
-    private fun handleClient(client: ClientState) {
+    private suspend fun handleClient(client: ClientState) {
         try {
             val input = client.socket.getInputStream()
             val buf = ByteArray(256)
             val accumulator = mutableListOf<Byte>()
 
-            while (running && !client.socket.isClosed) {
+            while (currentCoroutineContext().isActive && !client.socket.isClosed) {
                 val n = input.read(buf)
                 if (n <= 0) break
                 for (i in 0 until n) accumulator.add(buf[i])
@@ -193,7 +223,7 @@ class DirconServer(
 
                     val response = processPacket(client, packet)
                     if (response != null) {
-                        synchronized(client.output) {
+                        client.outputMutex.withLock {
                             client.output.write(response)
                             client.output.flush()
                         }
@@ -201,14 +231,14 @@ class DirconServer(
                 }
             }
         } catch (e: Exception) {
-            if (running) Log.d(TAG, "Client disconnected: ${e.message}")
+            if (currentCoroutineContext().isActive) Log.d(TAG, "Client disconnected: ${e.message}")
         } finally {
             clients.remove(client)
             client.socket.close()
         }
     }
 
-    private fun processPacket(client: ClientState, pkt: ByteArray): ByteArray? {
+    private suspend fun processPacket(client: ClientState, pkt: ByteArray): ByteArray? {
         val req = DirconPacket.parse(pkt)
         client.seq = req.seq
 
@@ -260,7 +290,7 @@ class DirconServer(
         return respond(MSG_READ_CHAR, seq, RESP_SUCCESS, data)
     }
 
-    private fun handleWriteChar(seq: Int, payload: ByteArray): ByteArray {
+    private suspend fun handleWriteChar(seq: Int, payload: ByteArray): ByteArray {
         if (payload.size < 16) return respond(MSG_WRITE_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
         val charUuid = uuidFromBytes(payload)
         val writeData = if (payload.size > 16) payload.copyOfRange(16, payload.size) else ByteArray(0)
@@ -306,7 +336,7 @@ class DirconServer(
         return respond(MSG_ENABLE_NOTIFY, seq, RESP_SUCCESS, respData)
     }
 
-    private fun pushNotifications() {
+    private suspend fun pushNotifications() {
         val snapshot = dataProvider()
 
         for (client in clients) {
@@ -321,7 +351,7 @@ class DirconServer(
                     treadmillData.copyInto(payload, 16)
 
                     val pkt = respond(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload)
-                    synchronized(client.output) {
+                    client.outputMutex.withLock {
                         client.output.write(pkt)
                         client.output.flush()
                     }
@@ -334,13 +364,13 @@ class DirconServer(
                     hrData.copyInto(payload, 16)
 
                     val pkt = respond(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload)
-                    synchronized(client.output) {
+                    client.outputMutex.withLock {
                         client.output.write(pkt)
                         client.output.flush()
                     }
                 }
             } catch (e: Exception) {
-                // Client disconnected — will be cleaned up in handleClient
+                Log.d(TAG, "Notify failed for client: ${e.message}")
             }
         }
     }

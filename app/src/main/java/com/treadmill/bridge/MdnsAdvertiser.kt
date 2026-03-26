@@ -3,10 +3,10 @@ package com.treadmill.bridge
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.util.Log
+import kotlinx.coroutines.*
 import java.net.DatagramPacket
 import java.net.InetAddress
 import java.net.MulticastSocket
-import kotlin.concurrent.thread
 
 /**
  * Raw multicast mDNS service advertiser.
@@ -75,9 +75,8 @@ class MdnsAdvertiser(
         }
     }
 
-    private var running = false
+    private var scope: CoroutineScope? = null
     private var multicastLock: WifiManager.MulticastLock? = null
-    private var socket: MulticastSocket? = null
 
     // Pre-built response packet
     private val responsePacket: ByteArray by lazy {
@@ -85,7 +84,6 @@ class MdnsAdvertiser(
     }
 
     fun start() {
-        running = true
         val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifiManager.createMulticastLock("mdns-advertiser").apply {
             setReferenceCounted(false)
@@ -93,50 +91,54 @@ class MdnsAdvertiser(
         }
         Log.d(TAG, "MulticastLock acquired")
 
-        thread(name = "mdns") {
+        val s = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        scope = s
+
+        s.launch {
             try {
                 val sock = MulticastSocket(MDNS_PORT)
                 sock.reuseAddress = true
                 sock.joinGroup(MDNS_ADDR)
                 sock.timeToLive = 255
                 sock.soTimeout = 1000
-                socket = sock
                 Log.d(TAG, "Joined multicast group, listening on :$MDNS_PORT")
 
-                announce(sock)
-                var lastAnnounce = System.currentTimeMillis()
+                try {
+                    announce(sock)
+                    var lastAnnounce = System.currentTimeMillis()
 
-                val buf = ByteArray(1500)
-                while (running) {
-                    try {
-                        val pkt = DatagramPacket(buf, buf.size)
-                        sock.receive(pkt)
-                        if (isQueryForOurService(buf, pkt.length)) {
-                            Log.d(TAG, "Query received, responding")
+                    val buf = ByteArray(1500)
+                    while (isActive) {
+                        try {
+                            val pkt = DatagramPacket(buf, buf.size)
+                            sock.receive(pkt)
+                            if (isQueryForOurService(buf, pkt.length)) {
+                                Log.d(TAG, "Query received, responding")
+                                announce(sock)
+                                lastAnnounce = System.currentTimeMillis()
+                            }
+                        } catch (_: java.net.SocketTimeoutException) {
+                            // Normal — check if re-announce needed
+                        }
+
+                        if (System.currentTimeMillis() - lastAnnounce > REANNOUNCE_MS) {
                             announce(sock)
                             lastAnnounce = System.currentTimeMillis()
                         }
-                    } catch (_: java.net.SocketTimeoutException) {
-                        // Normal — check if re-announce needed
                     }
-
-                    if (System.currentTimeMillis() - lastAnnounce > REANNOUNCE_MS) {
-                        announce(sock)
-                        lastAnnounce = System.currentTimeMillis()
-                    }
+                } finally {
+                    sock.leaveGroup(MDNS_ADDR)
+                    sock.close()
                 }
-
-                sock.leaveGroup(MDNS_ADDR)
-                sock.close()
             } catch (e: Exception) {
-                if (running) Log.e(TAG, "mDNS error", e)
+                if (isActive) Log.e(TAG, "mDNS error", e)
             }
         }
     }
 
     fun stop() {
-        running = false
-        socket?.close()
+        scope?.cancel()
+        scope = null
         multicastLock?.release()
         Log.d(TAG, "Stopped")
     }

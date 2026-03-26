@@ -1,7 +1,8 @@
 package com.treadmill.bridge
 
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -184,13 +185,13 @@ class FitPro1Test {
         val fp = FitPro1(fake)
 
         // Enqueue command BEFORE starting loop so it's processed first
-        val future = fp.setSpeed(8.5)
+        val deferred = fp.setSpeed(8.5)
         // Script enough responses: one for the command, extras for polls
         repeat(5) { fake.scriptResponse(doneResponse(2)) }
 
         fp.startUsbLoop()
         try {
-            val result = future.get(3, TimeUnit.SECONDS)
+            val result = runBlocking { withTimeout(3000) { deferred.await() } }
             assertTrue(result)
             Thread.sleep(100) // let writes settle
 
@@ -212,12 +213,12 @@ class FitPro1Test {
         val fake = FakeUsbTransport()
         val fp = FitPro1(fake)
 
-        val future = fp.setIncline(-2.0)
+        val deferred = fp.setIncline(-2.0)
         repeat(5) { fake.scriptResponse(doneResponse(2)) }
 
         fp.startUsbLoop()
         try {
-            val result = future.get(3, TimeUnit.SECONDS)
+            val result = runBlocking { withTimeout(3000) { deferred.await() } }
             assertTrue(result)
             Thread.sleep(100)
 
@@ -238,13 +239,13 @@ class FitPro1Test {
 
         val failResp = doneResponse(2)
         failResp[3] = 4 // Failed status
-        val future = fp.setSpeed(5.0)
+        val deferred = fp.setSpeed(5.0)
         fake.scriptResponse(failResp)
         repeat(4) { fake.scriptResponse(doneResponse(2)) }
 
         fp.startUsbLoop()
         try {
-            val result = future.get(3, TimeUnit.SECONDS)
+            val result = runBlocking { withTimeout(3000) { deferred.await() } }
             assertFalse(result)
         } finally {
             fp.stopUsbLoop()
@@ -275,9 +276,10 @@ class FitPro1Test {
             assertEquals(2, state.workoutMode) // Running
             assertFalse(state.startRequested)
 
-            // Verify snapshot
-            assertEquals(8.5, fp.lastSnapshot.speedKPH, 0.01)
-            assertEquals(-1.5, fp.lastSnapshot.inclinePct, 0.01)
+            // Verify snapshot via StateFlow
+            val snapshot = fp.snapshotFlow.value
+            assertEquals(8.5, snapshot.speedKPH, 0.01)
+            assertEquals(-1.5, snapshot.inclinePct, 0.01)
         } finally {
             fp.stopUsbLoop()
         }
@@ -287,12 +289,12 @@ class FitPro1Test {
         val fake = FakeUsbTransport()
         val fp = FitPro1(fake)
 
-        val future = fp.startWorkout(1.6, 0.0)
+        val deferred = fp.startWorkout(1.6, 0.0)
         repeat(5) { fake.scriptResponse(doneResponse(2)) }
 
         fp.startUsbLoop()
         try {
-            val result = future.get(3, TimeUnit.SECONDS)
+            val result = runBlocking { withTimeout(3000) { deferred.await() } }
             assertTrue(result)
             Thread.sleep(100)
 
@@ -321,12 +323,12 @@ class FitPro1Test {
         val fake = FakeUsbTransport()
         val fp = FitPro1(fake)
 
-        val future = fp.stopWorkout()
+        val deferred = fp.stopWorkout()
         repeat(5) { fake.scriptResponse(doneResponse(2)) }
 
         fp.startUsbLoop()
         try {
-            val result = future.get(3, TimeUnit.SECONDS)
+            val result = runBlocking { withTimeout(3000) { deferred.await() } }
             assertTrue(result)
             Thread.sleep(100)
 
@@ -342,23 +344,77 @@ class FitPro1Test {
         }
     }
 
-    // ========== Bug: initialize ignores VerifySecurity failure ==========
+    // ========== VerifySecurity rejection ==========
 
     @Test fun `initialize should fail when VerifySecurity is rejected`() {
         val fake = FakeUsbTransport()
-        // DeviceInfo — success
         fake.scriptResponse(deviceInfoResponse())
-        // SystemInfo — success
         fake.scriptResponse(systemInfoResponse())
-        // VerifySecurity — SecurityBlock (status 8)
         val secFail = doneResponse(0x90)
         secFail[3] = 8 // SecurityBlock
         fake.scriptResponse(secFail)
 
         val fp = FitPro1(fake)
-        // BUG: initialize() currently returns true here because it never checks
-        // the VerifySecurity response status. It should return false.
         assertFalse(fp.initialize(), "initialize() should fail when security verification is rejected")
+    }
+
+    // ========== Results mode auto-dismiss ==========
+
+    @Test fun `poll cycle auto-dismisses Results mode with stopWorkout`() {
+        val fake = FakeUsbTransport()
+        val fp = FitPro1(fake)
+
+        // Script: first poll returns Results mode (4), subsequent polls return Idle
+        fake.scriptResponse(pollResponse(0.0, 4, 0.0, false))
+        repeat(5) { fake.scriptResponse(pollResponse(0.0, 1, 0.0, false)) }
+
+        fp.startUsbLoop()
+        try {
+            Thread.sleep(1500)
+            // Verify a stopWorkout command was enqueued (length 9, mode byte = IDLE=1)
+            val all = mutableListOf<ByteArray>()
+            while (true) {
+                val msg = fake.written.poll() ?: break
+                all.add(msg)
+            }
+            val stopCmd = all.find { it.size >= 7 && it[1].toInt() == 9 && it[6].toInt() == 1 }
+            assertTrue(stopCmd != null, "stopWorkout should have been sent to dismiss Results mode")
+        } finally {
+            fp.stopUsbLoop()
+        }
+    }
+
+    // ========== Zwift-initiated startWorkout resets distance ==========
+
+    @Test fun `startWorkout resets distance and elapsed time`() {
+        val fake = FakeUsbTransport()
+        val fp = FitPro1(fake)
+
+        // Script polls with nonzero speed to accumulate distance
+        repeat(5) { fake.scriptResponse(pollResponse(10.0, 2, 0.0, false)) }
+
+        fp.startUsbLoop()
+        try {
+            Thread.sleep(1500)
+            val snapshotBefore = fp.snapshotFlow.value
+            assertTrue(snapshotBefore.distanceM > 0, "Should have accumulated distance")
+
+            // Now call startWorkout (simulating Zwift start) — should reset counters
+            repeat(5) { fake.scriptResponse(doneResponse(2)) }
+            val deferred = fp.startWorkout(1.6, 0.0)
+            runBlocking { withTimeout(3000) { deferred.await() } }
+            Thread.sleep(100)
+
+            // Next poll should show reset distance
+            repeat(3) { fake.scriptResponse(pollResponse(1.6, 2, 0.0, false)) }
+            Thread.sleep(1500)
+
+            val snapshotAfter = fp.snapshotFlow.value
+            assertTrue(snapshotAfter.distanceM < snapshotBefore.distanceM,
+                "Distance should have been reset by startWorkout")
+        } finally {
+            fp.stopUsbLoop()
+        }
     }
 
 }

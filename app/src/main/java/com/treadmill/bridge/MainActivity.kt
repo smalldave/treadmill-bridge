@@ -8,12 +8,10 @@ import android.content.IntentFilter
 import android.hardware.usb.*
 import android.net.wifi.WifiManager
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.app.Activity
 import android.widget.TextView
 import android.util.Log
-import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.*
 
 class MainActivity : Activity() {
     companion object {
@@ -28,7 +26,7 @@ class MainActivity : Activity() {
     private var fitPro1: FitPro1? = null
     private var dirconServer: DirconServer? = null
     private var mdnsAdvertiser: MdnsAdvertiser? = null
-    private val handler = Handler(Looper.getMainLooper())
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var readCount = 0
     private var errorCount = 0
 
@@ -56,6 +54,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        scope.cancel()
         fitPro1?.stopUsbLoop()
         dirconServer?.stop()
         mdnsAdvertiser?.stop()
@@ -83,7 +82,7 @@ class MainActivity : Activity() {
 
         status("Handshaking...")
 
-        Thread {
+        scope.launch(Dispatchers.IO) {
             val writeEp = intf.getEndpoint(1)
             val readEp = intf.getEndpoint(0)
             val transport = object : UsbTransport {
@@ -93,28 +92,32 @@ class MainActivity : Activity() {
                     connection.bulkTransfer(readEp, buf, buf.size, 50)
             }
             val fp = FitPro1(transport)
-            if (!fp.handshake()) { handler.post { status("Handshake FAILED", getColor(R.color.status_red)) }; return@Thread }
-            handler.post { status("Initializing...") }
+            if (!fp.handshake()) { withContext(Dispatchers.Main) { status("Handshake FAILED", getColor(R.color.status_red)) }; return@launch }
+            withContext(Dispatchers.Main) { status("Initializing...") }
 
-            fp.initialize()
+            if (!fp.initialize()) {
+                withContext(Dispatchers.Main) { status("Init FAILED — security rejected", getColor(R.color.status_red)) }
+                return@launch
+            }
             fitPro1 = fp
 
-            // UI updates from USB loop
+            // Single UI update path — onStateUpdate fires on every poll with
+            // both live state (mode, startRequested) and snapshot (distance, elapsed).
             fp.onStateUpdate = { state ->
                 readCount++
-                val clients = dirconServer?.clientCount ?: 0
-                val elapsed = if (fp.lastSnapshot.elapsedSec > 0) fp.lastSnapshot.elapsedSec else 0
                 val modeName = fp.workoutModeName(state.workoutMode)
-                handler.post {
+                scope.launch(Dispatchers.Main) {
+                    val clients = dirconServer?.clientCount ?: 0
+                    val snapshot = fp.snapshotFlow.value
                     metricsText.text = "Speed:   %.1f km/h\nIncline: %.1f%%\nMode:    %s\nDist:    %dm\nTime:    %ds\nStart:   %s\nZwift:   %d client%s"
-                        .format(state.speedKPH, state.inclinePct, modeName, fp.lastSnapshot.distanceM, elapsed,
+                        .format(state.speedKPH, state.inclinePct, modeName, snapshot.distanceM, snapshot.elapsedSec,
                             if (state.startRequested) "yes" else "no", clients, if (clients != 1) "s" else "")
                     statsText.text = "Reads: $readCount  Errors: $errorCount"
                 }
             }
 
             // Start Dircon server — reads cached snapshot, never touches USB
-            val server = DirconServer(DIRCON_PORT) { fp.lastSnapshot }
+            val server = DirconServer(DIRCON_PORT) { fp.snapshotFlow.value }
             server.onControlCommand = { opcode, params -> handleControlCommand(fp, opcode, params) }
             server.start()
             dirconServer = server
@@ -122,32 +125,32 @@ class MainActivity : Activity() {
             // Start USB loop (single thread owns USB from here on)
             fp.startUsbLoop()
 
-            handler.post {
+            withContext(Dispatchers.Main) {
                 startMdns()
                 status("Ready — Dircon :$DIRCON_PORT", getColor(R.color.status_green))
             }
-        }.start()
+        }
     }
 
-    private fun handleControlCommand(fp: FitPro1, opcode: Int, params: ByteArray): Boolean {
+    private suspend fun handleControlCommand(fp: FitPro1, opcode: Int, params: ByteArray): Boolean {
         return try {
             when (opcode) {
                 0x02 -> { // Set target speed
                     if (params.size >= 2) {
                         val speed = ((params[0].toInt() and 0xFF) or ((params[1].toInt() and 0xFF) shl 8)) / 100.0
                         Log.d(TAG, "Zwift set speed: $speed km/h")
-                        fp.setSpeed(speed).get(2, TimeUnit.SECONDS) // block for result
+                        withTimeout(2000) { fp.setSpeed(speed).await() }
                     } else false
                 }
                 0x03 -> { // Set target incline
                     if (params.size >= 2) {
                         val incline = ((params[0].toInt() and 0xFF) or ((params[1].toInt() and 0xFF) shl 8)).toShort() / 10.0
                         Log.d(TAG, "Zwift set incline: $incline%")
-                        fp.setIncline(incline).get(2, TimeUnit.SECONDS)
+                        withTimeout(2000) { fp.setIncline(incline).await() }
                     } else false
                 }
-                0x07 -> { Log.d(TAG, "Zwift: start"); fp.startWorkout(FitPro1.MIN_SPEED_KPH, 0.0).get(2, TimeUnit.SECONDS) }
-                0x08 -> { Log.d(TAG, "Zwift: stop"); fp.stopWorkout().get(2, TimeUnit.SECONDS) }
+                0x07 -> { Log.d(TAG, "Zwift: start"); withTimeout(2000) { fp.startWorkout(FitPro1.MIN_SPEED_KPH, 0.0).await() } }
+                0x08 -> { Log.d(TAG, "Zwift: stop"); withTimeout(2000) { fp.stopWorkout().await() } }
                 else -> { Log.d(TAG, "Unknown opcode: $opcode"); false }
             }
         } catch (e: Exception) {

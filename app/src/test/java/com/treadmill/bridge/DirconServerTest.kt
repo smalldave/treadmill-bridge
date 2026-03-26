@@ -48,7 +48,10 @@ class DirconServerTest {
     }
 
     private fun startServer(snapshot: DirconServer.TreadmillSnapshot = DirconServer.TreadmillSnapshot()): Pair<DirconServer, Int> {
-        val port = 46866 + (Math.random() * 1000).toInt()
+        // Use port 0 to let the OS assign an ephemeral port, avoiding collisions
+        val ss = java.net.ServerSocket(0)
+        val port = ss.localPort
+        ss.close()
         val server = DirconServer(port) { snapshot }
         server.start()
         Thread.sleep(200)
