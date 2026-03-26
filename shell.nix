@@ -26,10 +26,14 @@ pkgs.mkShell {
     echo "Android SDK: $ANDROID_HOME"
     echo "Java: $(java -version 2>&1 | head -1)"
     echo ""
-    echo "Build:   gradle assembleDebug"
-    echo "Install: adb install app/build/outputs/apk/debug/app-debug.apk"
-    echo "Launch:  adb shell am start -n com.treadmill.bridge/.MainActivity"
+    echo "Build:   make build"
+    echo "Release: make release"
+    echo "Install: make install"
+    echo "Clean:   make clean"
+    echo "Version: make version"
+    echo "Help:    make help"
     echo ""
+    echo "Launch:  adb shell am start -n com.treadmill.bridge/.MainActivity"
     echo "IMPORTANT: Stop wolf first: adb shell am force-stop com.ifit.wolf"
   '';
 }
