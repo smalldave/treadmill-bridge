@@ -1,0 +1,37 @@
+{
+  "name": "treadmill-bridge-devcontainer",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "17",
+      "installGradle": "true",
+      "gradleVersion": "7.6.1"
+    },
+    "ghcr.io/nordcominc/devcontainer-features/android-sdk:1": {
+      "platform": "33",
+      "build_tools": "33.0.2",
+      "extra_packages": "build-tools;30.0.3"
+    },
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "containerEnv": {
+    "GRADLE_OPTS": "-Dorg.gradle.project.android.aapt2FromMavenOverride=/usr/local/lib/android/build-tools/33.0.2/aapt2"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "eamodio.gitlens",
+        "fwcd.kotlin",
+        "vscjava.vscode-gradle",
+        "redhat.vscode-xml"
+      ]
+    }
+  },
+  "mounts": [
+    "source=${localWorkspaceFolder}/.claude,target=/home/vscode/.claude,type=bind"
+  ],
+  "updateRemoteUserUID": true,
+  "remoteUser": "vscode",
+  "postCreateCommand": ".devcontainer/post-create.sh"
+}
