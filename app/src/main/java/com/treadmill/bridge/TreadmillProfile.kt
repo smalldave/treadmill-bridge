@@ -11,7 +11,9 @@ object TreadmillProfile {
     const val USB_VENDOR_ID = 8508
     const val USB_PRODUCT_ID = 2
 
-    // Speed limits (km/h)
+    // Speed limits (km/h).
+    // MIN_SPEED_KPH is the lowest safe belt speed for this hardware.
+    // FTMS_SPEED_MIN is the protocol floor advertised to Zwift (lower for client compatibility).
     const val MIN_SPEED_KPH = 1.6
     const val MAX_SPEED_KPH = 15.0
     const val SPEED_STEP_KPH = 1.0

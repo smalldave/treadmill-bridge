@@ -50,7 +50,7 @@ object DnsPacket {
                     dos.writeShort(TYPE_PTR.toInt())
                     dos.writeShort(CLASS_IN.toInt()) // PTR doesn't use cache-flush
                     dos.writeInt(record.ttl)
-                    val rdata = buildNameBytes(record.target, nameOffsets, bos.size() + 2)
+                    val rdata = buildNameBytes(record.target, nameOffsets)
                     dos.writeShort(rdata.size)
                     nameOffsets[record.target] = bos.size()
                     dos.write(rdata)
@@ -161,8 +161,10 @@ object DnsPacket {
         var offset = startOffset
         var bytesConsumed = 0
         var followedPointer = false
+        var hops = 0
 
         while (offset < len) {
+            if (++hops > 128) break // guard against cyclic compression pointers
             val b = bytes[offset].toInt() and 0xFF
             if (b == 0) {
                 if (!followedPointer) bytesConsumed = offset - startOffset + 1
@@ -213,7 +215,7 @@ object DnsPacket {
         dos.writeByte(0)
     }
 
-    private fun buildNameBytes(name: String, offsets: Map<String, Int>, currentOffset: Int): ByteArray {
+    private fun buildNameBytes(name: String, offsets: Map<String, Int>): ByteArray {
         val bos2 = ByteArrayOutputStream()
         val dos2 = DataOutputStream(bos2)
         val parts = name.split(".")

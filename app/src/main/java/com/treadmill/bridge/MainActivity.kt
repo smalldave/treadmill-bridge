@@ -21,6 +21,7 @@ class MainActivity : Activity() {
     private lateinit var statsText: TextView
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var service: BridgeService? = null
+    private var bound = false
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -44,13 +45,16 @@ class MainActivity : Activity() {
             startForegroundService(intent)
         else
             startService(intent)
-        bindService(intent, connection, BIND_AUTO_CREATE)
+        bound = bindService(intent, connection, BIND_AUTO_CREATE)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         scope.cancel()
-        unbindService(connection)
+        if (bound) {
+            unbindService(connection)
+            bound = false
+        }
     }
 
     private fun observeStatus() {
