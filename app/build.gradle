@@ -14,7 +14,7 @@ def getVersionName = {
         def desc = process.text.trim().replaceFirst("^v", "")
         return desc ?: "0.0.0"
     } catch (Exception e) {
-        return "0.0.0"
+        return "0.0.1"
     }
 }
 
@@ -27,7 +27,7 @@ def getVersionCode = { String versionName ->
 }
 
 def appVersionName = getVersionName()
-def appVersionCode = getVersionCode(appVersionName)
+def appVersionCode = Math.max(getVersionCode(appVersionName), 1)
 
 android {
     namespace 'com.treadmill.bridge'

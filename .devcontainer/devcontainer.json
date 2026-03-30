@@ -23,6 +23,7 @@
         "anthropic.claude-code",
         "eamodio.gitlens",
         "fwcd.kotlin",
+        "vscjava.vscode-java-pack",
         "vscjava.vscode-gradle",
         "redhat.vscode-xml"
       ]
