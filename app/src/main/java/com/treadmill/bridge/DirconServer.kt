@@ -17,7 +17,8 @@ import java.util.concurrent.CopyOnWriteArrayList
  */
 class DirconServer(
     private val port: Int = 36866,
-    private val dataProvider: () -> TreadmillSnapshot
+    private val dataProvider: () -> TreadmillSnapshot,
+    private val onControlCommand: suspend (opcode: Int, params: ByteArray) -> Boolean
 ) {
     companion object {
         private const val TAG = "Dircon"
@@ -32,6 +33,12 @@ class DirconServer(
         internal const val MSG_UNSOLICITED_NOTIFY: Byte = 0x06
         private const val MSG_UNKNOWN_07: Byte = 0x07
 
+        // FTMS Control Point opcodes
+        const val FTMS_SET_SPEED = 0x02
+        const val FTMS_SET_INCLINE = 0x03
+        const val FTMS_START = 0x07
+        const val FTMS_STOP = 0x08
+
         // Response codes
         internal const val RESP_SUCCESS: Byte = 0x00
         internal const val RESP_SERVICE_NOT_FOUND: Byte = 0x03
@@ -42,6 +49,22 @@ class DirconServer(
         private const val PROP_WRITE = 0x02
         private const val PROP_NOTIFY = 0x04
         private const val PROP_INDICATE = 0x08
+
+        // BLE service UUIDs
+        private const val SVC_FTMS = 0x1826
+        private const val SVC_HEART_RATE = 0x180D
+
+        // Training status: idle
+        private val TRAINING_STATUS_IDLE = byteArrayOf(0x00, 0x01)
+
+        // BLE characteristic UUIDs
+        private const val CHAR_FTMS_FEATURE = 0x2ACC
+        private const val CHAR_SUPPORTED_SPEED_RANGE = 0x2AD6
+        private const val CHAR_TRAINING_STATUS = 0x2AD3
+        private const val CHAR_FTMS_CONTROL_POINT = 0x2AD9
+        private const val CHAR_TREADMILL_DATA = 0x2ACD
+        private const val CHAR_FTMS_STATUS = 0x2ADA
+        private const val CHAR_HR_MEASUREMENT = 0x2A37
 
         // BLE Base UUID template
         private val BLE_BASE_UUID = byteArrayOf(
@@ -59,6 +82,21 @@ class DirconServer(
         internal fun uuidFromBytes(bytes: ByteArray, offset: Int = 0): Int {
             return ((bytes[offset + 2].toInt() and 0xFF) shl 8) or (bytes[offset + 3].toInt() and 0xFF)
         }
+
+        // Treadmill FTMS service (from qdomyos-zwift dirconmanager.cpp lines 53-66)
+        private val SERVICES = listOf(
+            ServiceDef(SVC_FTMS, listOf(
+                CharDef(CHAR_FTMS_FEATURE, PROP_READ, TreadmillProfile.FTMS_FEATURE_FLAGS),
+                CharDef(CHAR_SUPPORTED_SPEED_RANGE, PROP_READ, TreadmillProfile.FTMS_SPEED_RANGE),
+                CharDef(CHAR_TRAINING_STATUS, PROP_READ, TRAINING_STATUS_IDLE),
+                CharDef(CHAR_FTMS_CONTROL_POINT, PROP_WRITE or PROP_INDICATE),
+                CharDef(CHAR_TREADMILL_DATA, PROP_NOTIFY),
+                CharDef(CHAR_FTMS_STATUS, PROP_NOTIFY)
+            )),
+            ServiceDef(SVC_HEART_RATE, listOf(
+                CharDef(CHAR_HR_MEASUREMENT, PROP_NOTIFY)
+            ))
+        )
     }
 
     /** Dircon protocol packet — shared between server and tests.
@@ -118,30 +156,13 @@ class DirconServer(
     )
 
     // Characteristic definition
-    data class CharDef(val uuid: Int, val props: Int, val readValue: ByteArray)
+    data class CharDef(val uuid: Int, val props: Int, val readValue: ByteArray = byteArrayOf())
 
     // Service definition
     data class ServiceDef(val uuid: Int, val chars: List<CharDef>)
 
-    // Treadmill FTMS service (from qdomyos-zwift dirconmanager.cpp lines 53-66)
-    private val services = listOf(
-        ServiceDef(0x1826, listOf(
-            CharDef(0x2ACC, PROP_READ, byteArrayOf(0x08, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)),
-            CharDef(0x2AD6, PROP_READ, byteArrayOf(0x0A, 0x00, 0x96.toByte(), 0x00, 0x0A, 0x00)),
-            CharDef(0x2AD3, PROP_READ, byteArrayOf(0x00, 0x01)),
-            CharDef(0x2AD9, PROP_WRITE or PROP_INDICATE, byteArrayOf(0x00)),
-            CharDef(0x2ACD, PROP_NOTIFY, byteArrayOf(0x00)),
-            CharDef(0x2ADA, PROP_NOTIFY, byteArrayOf(0x00))
-        )),
-        ServiceDef(0x180D, listOf(
-            CharDef(0x2A37, PROP_NOTIFY, byteArrayOf(0x00))
-        ))
-    )
-
     private val clients = CopyOnWriteArrayList<ClientState>()
-    private var scope: CoroutineScope? = null
-    private var serverSocket: ServerSocket? = null
-    var onControlCommand: (suspend (opcode: Int, params: ByteArray) -> Boolean)? = null
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     class ClientState(
         val socket: Socket,
@@ -152,14 +173,10 @@ class DirconServer(
     )
 
     fun start() {
-        val s = CoroutineScope(Dispatchers.IO + SupervisorJob())
-        scope = s
-
         // Accept loop
-        s.launch {
+        scope.launch {
             try {
                 val ss = ServerSocket(port)
-                serverSocket = ss
                 Log.d(TAG, "Listening on TCP :$port")
                 try {
                     while (isActive) {
@@ -178,7 +195,7 @@ class DirconServer(
         }
 
         // Notification push loop
-        s.launch {
+        scope.launch {
             while (isActive) {
                 try {
                     pushNotifications()
@@ -191,10 +208,7 @@ class DirconServer(
     }
 
     fun stop() {
-        scope?.cancel()
-        scope = null
-        serverSocket?.close()
-        serverSocket = null
+        scope.cancel()
         clients.forEach { it.socket.close() }
         clients.clear()
     }
@@ -204,22 +218,23 @@ class DirconServer(
     private suspend fun handleClient(client: ClientState) {
         try {
             val input = client.socket.getInputStream()
-            val buf = ByteArray(256)
-            val accumulator = mutableListOf<Byte>()
+            val readBuf = ByteArray(4096)
+            val buf = java.nio.ByteBuffer.allocate(4096)
 
             while (currentCoroutineContext().isActive && !client.socket.isClosed) {
-                val n = input.read(buf)
+                val n = input.read(readBuf)
                 if (n <= 0) break
-                for (i in 0 until n) accumulator.add(buf[i])
+                buf.put(readBuf, 0, n)
+                buf.flip()
 
-                while (accumulator.size >= 6) {
-                    val payloadLen = ((accumulator[4].toInt() and 0xFF) shl 8) or
-                                    (accumulator[5].toInt() and 0xFF)
+                while (buf.remaining() >= 6) {
+                    val payloadLen = ((buf.get(buf.position() + 4).toInt() and 0xFF) shl 8) or
+                                    (buf.get(buf.position() + 5).toInt() and 0xFF)
                     val totalLen = 6 + payloadLen
-                    if (accumulator.size < totalLen) break
+                    if (buf.remaining() < totalLen) break
 
-                    val packet = accumulator.subList(0, totalLen).toByteArray()
-                    accumulator.subList(0, totalLen).clear()
+                    val packet = ByteArray(totalLen)
+                    buf.get(packet)
 
                     val response = processPacket(client, packet)
                     if (response != null) {
@@ -229,6 +244,7 @@ class DirconServer(
                         }
                     }
                 }
+                buf.compact()
             }
         } catch (e: Exception) {
             if (currentCoroutineContext().isActive) Log.d(TAG, "Client disconnected: ${e.message}")
@@ -257,15 +273,15 @@ class DirconServer(
     }
 
     private fun handleDiscoverServices(seq: Int): ByteArray {
-        val uuids = ByteArray(services.size * 16)
-        services.forEachIndexed { i, svc -> uuidToBytes(svc.uuid).copyInto(uuids, i * 16) }
+        val uuids = ByteArray(SERVICES.size * 16)
+        SERVICES.forEachIndexed { i, svc -> uuidToBytes(svc.uuid).copyInto(uuids, i * 16) }
         return respond(MSG_DISCOVER_SERVICES, seq, RESP_SUCCESS, uuids)
     }
 
     private fun handleDiscoverChars(seq: Int, payload: ByteArray): ByteArray {
         if (payload.size < 16) return respond(MSG_DISCOVER_CHARS, seq, RESP_SERVICE_NOT_FOUND, ByteArray(0))
         val svcUuid = uuidFromBytes(payload)
-        val svc = services.find { it.uuid == svcUuid }
+        val svc = SERVICES.find { it.uuid == svcUuid }
             ?: return respond(MSG_DISCOVER_CHARS, seq, RESP_SERVICE_NOT_FOUND, ByteArray(0))
 
         // Response: service UUID (16) + for each char: UUID (16) + props (1)
@@ -281,7 +297,7 @@ class DirconServer(
     private fun handleReadChar(seq: Int, payload: ByteArray): ByteArray {
         if (payload.size < 16) return respond(MSG_READ_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
         val charUuid = uuidFromBytes(payload)
-        val charDef = services.flatMap { it.chars }.find { it.uuid == charUuid }
+        val charDef = SERVICES.flatMap { it.chars }.find { it.uuid == charUuid }
             ?: return respond(MSG_READ_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
 
         val data = ByteArray(16 + charDef.readValue.size)
@@ -297,11 +313,11 @@ class DirconServer(
 
         Log.d(TAG, "Write 0x${charUuid.toString(16)}: ${writeData.joinToString(" ") { "%02X".format(it) }}")
 
-        if (charUuid == 0x2AD9 && writeData.isNotEmpty()) {
+        if (charUuid == CHAR_FTMS_CONTROL_POINT && writeData.isNotEmpty()) {
             // FTMS Control Point
             val opcode = writeData[0].toInt() and 0xFF
             val params = if (writeData.size > 1) writeData.copyOfRange(1, writeData.size) else ByteArray(0)
-            val ok = onControlCommand?.invoke(opcode, params) ?: false
+            val ok = onControlCommand(opcode, params)
 
             // Send indication response: UUID + [0x80, opcode, result]
             val indication = ByteArray(16 + 3)
@@ -341,13 +357,13 @@ class DirconServer(
 
         for (client in clients) {
             try {
-                if (0x2ACD in client.notifyUuids) {
+                if (CHAR_TREADMILL_DATA in client.notifyUuids) {
                     val treadmillData = FtmsEncoder.encodeTreadmillData(
                         snapshot.speedKPH, snapshot.inclinePct, snapshot.heartRate,
                         snapshot.distanceM, snapshot.elapsedSec
                     )
                     val payload = ByteArray(16 + treadmillData.size)
-                    uuidToBytes(0x2ACD).copyInto(payload, 0)
+                    uuidToBytes(CHAR_TREADMILL_DATA).copyInto(payload, 0)
                     treadmillData.copyInto(payload, 16)
 
                     val pkt = respond(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload)
@@ -357,10 +373,10 @@ class DirconServer(
                     }
                 }
 
-                if (0x2A37 in client.notifyUuids && snapshot.heartRate > 0) {
+                if (CHAR_HR_MEASUREMENT in client.notifyUuids && snapshot.heartRate > 0) {
                     val hrData = FtmsEncoder.encodeHRMeasurement(snapshot.heartRate)
                     val payload = ByteArray(16 + hrData.size)
-                    uuidToBytes(0x2A37).copyInto(payload, 0)
+                    uuidToBytes(CHAR_HR_MEASUREMENT).copyInto(payload, 0)
                     hrData.copyInto(payload, 16)
 
                     val pkt = respond(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload)

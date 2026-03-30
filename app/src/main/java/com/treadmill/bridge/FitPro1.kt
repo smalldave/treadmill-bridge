@@ -39,7 +39,6 @@ class FitPro1(
 
         const val WORKOUT_MODE_IDLE = 1
         const val WORKOUT_MODE_RUNNING = 2
-        const val MIN_SPEED_KPH = 1.6
     }
 
     // ========== Command Channel ==========
@@ -83,6 +82,9 @@ class FitPro1(
     private var startTimeMs = 0L
     private var lastPollMs = System.currentTimeMillis()
     var onStateUpdate: ((TreadmillState) -> Unit)? = null
+
+    /** Completes when the USB link is terminally dead. Owner should teardown and reconnect. */
+    val terminalFailure = CompletableDeferred<Exception>()
 
     // ========== Handshake (runs on caller's thread, before USB loop starts) ==========
 
@@ -159,8 +161,16 @@ class FitPro1(
         // Poll cycle — fixed 500ms interval
         scope.launch {
             Log.d(TAG, "USB loop started")
+            var consecutiveFailures = 0
             while (isActive) {
-                doPoll()
+                if (doPoll()) {
+                    consecutiveFailures = 0
+                } else if (++consecutiveFailures >= MAX_READ_RETRIES) {
+                    Log.e(TAG, "USB link dead ($consecutiveFailures consecutive poll failures)")
+                    terminalFailure.complete(Exception("USB poll failed $consecutiveFailures times"))
+                    cancel()
+                    return@launch
+                }
                 delay(POLL_INTERVAL_MS)
             }
             Log.d(TAG, "USB loop stopped")
@@ -172,13 +182,13 @@ class FitPro1(
         usbScope = null
     }
 
-    private fun doPoll() {
+    private fun doPoll(): Boolean {
         val readReq = buildReadRequest(listOf(BF_KPH, BF_WORKOUT_MODE, BF_ACTUAL_INCLINE, BF_START_REQUESTED))
-        val resp = sendAndRead(readReq, "poll", 80) ?: return
-        if (!isSuccess(resp)) return
+        val resp = sendAndRead(readReq, "poll", 80) ?: return false
+        if (!isSuccess(resp)) return false
 
         // Poll response: header(4) + speed(2) + mode(1) + incline(2) + startReq(1) = 10 bytes min
-        if (resp.size < 10) return
+        if (resp.size < 10) return false
         val buf = resp.asLEBuffer().apply { position(4) }
         val speedKPH = buf.readU16() / 100.0
         val mode = buf.readU8()
@@ -193,6 +203,7 @@ class FitPro1(
             if (startTimeMs > 0) ((now - startTimeMs) / 1000).toInt() else 0
         )
         onStateUpdate?.invoke(state)
+        return true
     }
 
     private fun executeCommand(cmd: UsbCommand) {
@@ -275,7 +286,7 @@ class FitPro1(
 
         if (state.startRequested && !running) {
             Log.d(TAG, "START pressed")
-            startWorkout(MIN_SPEED_KPH, state.inclinePct)
+            startWorkout(TreadmillProfile.MIN_SPEED_KPH, state.inclinePct)
         } else if (!state.startRequested && running && state.speedKPH == 0.0) {
             Log.d(TAG, "Stopped"); running = false
         }

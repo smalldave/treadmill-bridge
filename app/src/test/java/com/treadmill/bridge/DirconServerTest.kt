@@ -47,12 +47,15 @@ class DirconServerTest {
         return DirconPacket.parse(header)
     }
 
-    private fun startServer(snapshot: DirconServer.TreadmillSnapshot = DirconServer.TreadmillSnapshot()): Pair<DirconServer, Int> {
+    private fun startServer(
+        snapshot: DirconServer.TreadmillSnapshot = DirconServer.TreadmillSnapshot(),
+        onControlCommand: suspend (Int, ByteArray) -> Boolean = { _, _ -> false }
+    ): Pair<DirconServer, Int> {
         // Use port 0 to let the OS assign an ephemeral port, avoiding collisions
         val ss = java.net.ServerSocket(0)
         val port = ss.localPort
         ss.close()
-        val server = DirconServer(port) { snapshot }
+        val server = DirconServer(port, { snapshot }, onControlCommand)
         server.start()
         Thread.sleep(200)
         return server to port
@@ -170,15 +173,14 @@ class DirconServerTest {
     // ========== Write / FTMS Control Point ==========
 
     @Test fun `write FTMS control point fires callback with opcode and params`() {
-        val (server, port) = startServer()
+        var receivedOpcode = -1
+        var receivedParams = ByteArray(0)
+        val (server, port) = startServer(onControlCommand = { opcode, params ->
+            receivedOpcode = opcode
+            receivedParams = params
+            true
+        })
         try {
-            var receivedOpcode = -1
-            var receivedParams = ByteArray(0)
-            server.onControlCommand = { opcode, params ->
-                receivedOpcode = opcode
-                receivedParams = params
-                true
-            }
 
             val client = connectClient(port)
             val writePayload = uuidToBytes(0x2AD9) + byteArrayOf(0x02, 0x52, 0x03)
@@ -205,10 +207,8 @@ class DirconServerTest {
     }
 
     @Test fun `write control point returns failure when callback returns false`() {
-        val (server, port) = startServer()
+        val (server, port) = startServer(onControlCommand = { _, _ -> false })
         try {
-            server.onControlCommand = { _, _ -> false }
-
             val client = connectClient(port)
             val writePayload = uuidToBytes(0x2AD9) + byteArrayOf(0x08)
             client.getOutputStream().apply {

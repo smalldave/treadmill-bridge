@@ -75,8 +75,8 @@ class MdnsAdvertiser(
         }
     }
 
-    private var scope: CoroutineScope? = null
-    private var multicastLock: WifiManager.MulticastLock? = null
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private lateinit var multicastLock: WifiManager.MulticastLock
 
     // Pre-built response packet
     private val responsePacket: ByteArray by lazy {
@@ -91,10 +91,7 @@ class MdnsAdvertiser(
         }
         Log.d(TAG, "MulticastLock acquired")
 
-        val s = CoroutineScope(Dispatchers.IO + SupervisorJob())
-        scope = s
-
-        s.launch {
+        scope.launch {
             try {
                 val sock = MulticastSocket(MDNS_PORT)
                 sock.reuseAddress = true
@@ -137,9 +134,8 @@ class MdnsAdvertiser(
     }
 
     fun stop() {
-        scope?.cancel()
-        scope = null
-        multicastLock?.release()
+        scope.cancel()
+        multicastLock.release()
         Log.d(TAG, "Stopped")
     }
 

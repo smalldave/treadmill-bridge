@@ -1,43 +1,34 @@
 package com.treadmill.bridge
 
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.Context
+import android.content.ComponentName
 import android.content.Intent
-import android.content.IntentFilter
-import android.hardware.usb.*
-import android.net.wifi.WifiManager
+import android.content.ServiceConnection
+import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.app.Activity
 import android.widget.TextView
-import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.collectLatest
 
+/**
+ * UI-only Activity. Binds to BridgeService to display status and metrics.
+ * Can be destroyed/recreated without affecting the treadmill connection.
+ */
 class MainActivity : Activity() {
-    companion object {
-        private const val TAG = "TreadmillBridge"
-        private const val ACTION_USB_PERMISSION = "com.treadmill.bridge.USB_PERMISSION"
-        private const val DIRCON_PORT = 36866
-    }
-
     private lateinit var statusText: TextView
     private lateinit var metricsText: TextView
     private lateinit var statsText: TextView
-    private var fitPro1: FitPro1? = null
-    private var dirconServer: DirconServer? = null
-    private var mdnsAdvertiser: MdnsAdvertiser? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private var readCount = 0
-    private var errorCount = 0
+    private var service: BridgeService? = null
 
-    private val usbReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == ACTION_USB_PERMISSION) {
-                val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
-                val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                if (granted && device != null) connectToDevice(device)
-                else status("USB permission denied", getColor(R.color.status_red))
-            }
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            service = (binder as BridgeService.LocalBinder).service
+            observeStatus()
+        }
+        override fun onServiceDisconnected(name: ComponentName) {
+            service = null
         }
     }
 
@@ -47,137 +38,29 @@ class MainActivity : Activity() {
         statusText = findViewById(R.id.statusText)
         metricsText = findViewById(R.id.metricsText)
         statsText = findViewById(R.id.statsText)
-        registerReceiver(usbReceiver, IntentFilter(ACTION_USB_PERMISSION))
-        status("Looking for motor controller…")
-        findAndConnect()
+
+        val intent = Intent(this, BridgeService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            startForegroundService(intent)
+        else
+            startService(intent)
+        bindService(intent, connection, BIND_AUTO_CREATE)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         scope.cancel()
-        fitPro1?.stopUsbLoop()
-        dirconServer?.stop()
-        mdnsAdvertiser?.stop()
-        unregisterReceiver(usbReceiver)
+        unbindService(connection)
     }
 
-    private fun findAndConnect() {
-        val usbManager = getSystemService(USB_SERVICE) as UsbManager
-        val device = usbManager.deviceList.values.firstOrNull { it.vendorId == 8508 && it.productId == 2 }
-        if (device == null) { status("No motor controller found", getColor(R.color.status_red)); return }
-        if (usbManager.hasPermission(device)) connectToDevice(device)
-        else {
-            usbManager.requestPermission(device,
-                PendingIntent.getBroadcast(this, 0, Intent(ACTION_USB_PERMISSION), PendingIntent.FLAG_IMMUTABLE))
-            status("Requesting USB permission...")
-        }
-    }
-
-    private fun connectToDevice(device: UsbDevice) {
-        val usbManager = getSystemService(USB_SERVICE) as UsbManager
-        val connection = usbManager.openDevice(device) ?: run { status("Failed to open USB", getColor(R.color.status_red)); return }
-        val intf = device.getInterface(0)
-        connection.claimInterface(intf, true)
-        if (intf.endpointCount < 2) { status("Need 2 endpoints", getColor(R.color.status_red)); return }
-
-        status("Handshaking...")
-
-        scope.launch(Dispatchers.IO) {
-            val writeEp = intf.getEndpoint(1)
-            val readEp = intf.getEndpoint(0)
-            val transport = object : UsbTransport {
-                override fun write(data: ByteArray) =
-                    connection.bulkTransfer(writeEp, data, data.size, 50) >= 0
-                override fun read(buf: ByteArray) =
-                    connection.bulkTransfer(readEp, buf, buf.size, 50)
-            }
-            val fp = FitPro1(transport)
-            if (!fp.handshake()) { withContext(Dispatchers.Main) { status("Handshake FAILED", getColor(R.color.status_red)) }; return@launch }
-            withContext(Dispatchers.Main) { status("Initializing...") }
-
-            if (!fp.initialize()) {
-                withContext(Dispatchers.Main) { status("Init FAILED — security rejected", getColor(R.color.status_red)) }
-                return@launch
-            }
-            fitPro1 = fp
-
-            // Single UI update path — onStateUpdate fires on every poll with
-            // both live state (mode, startRequested) and snapshot (distance, elapsed).
-            fp.onStateUpdate = { state ->
-                readCount++
-                val modeName = fp.workoutModeName(state.workoutMode)
-                scope.launch(Dispatchers.Main) {
-                    val clients = dirconServer?.clientCount ?: 0
-                    val snapshot = fp.snapshotFlow.value
-                    metricsText.text = "Speed:   %.1f km/h\nIncline: %.1f%%\nMode:    %s\nDist:    %dm\nTime:    %ds\nStart:   %s\nZwift:   %d client%s"
-                        .format(state.speedKPH, state.inclinePct, modeName, snapshot.distanceM, snapshot.elapsedSec,
-                            if (state.startRequested) "yes" else "no", clients, if (clients != 1) "s" else "")
-                    statsText.text = "Reads: $readCount  Errors: $errorCount"
-                }
-            }
-
-            // Start Dircon server — reads cached snapshot, never touches USB
-            val server = DirconServer(DIRCON_PORT) { fp.snapshotFlow.value }
-            server.onControlCommand = { opcode, params -> handleControlCommand(fp, opcode, params) }
-            server.start()
-            dirconServer = server
-
-            // Start USB loop (single thread owns USB from here on)
-            fp.startUsbLoop()
-
-            withContext(Dispatchers.Main) {
-                startMdns()
-                status("Ready — Dircon :$DIRCON_PORT", getColor(R.color.status_green))
+    private fun observeStatus() {
+        scope.launch {
+            service?.status?.collectLatest { s ->
+                statusText.text = s.statusMsg
+                statusText.setTextColor(getColor(s.statusColor))
+                if (s.metricsMsg.isNotEmpty()) metricsText.text = s.metricsMsg
+                statsText.text = "Reads: ${s.readCount}  Errors: ${s.errorCount}"
             }
         }
-    }
-
-    private suspend fun handleControlCommand(fp: FitPro1, opcode: Int, params: ByteArray): Boolean {
-        return try {
-            when (opcode) {
-                0x02 -> { // Set target speed
-                    if (params.size >= 2) {
-                        val speed = ((params[0].toInt() and 0xFF) or ((params[1].toInt() and 0xFF) shl 8)) / 100.0
-                        Log.d(TAG, "Zwift set speed: $speed km/h")
-                        withTimeout(2000) { fp.setSpeed(speed).await() }
-                    } else false
-                }
-                0x03 -> { // Set target incline
-                    if (params.size >= 2) {
-                        val incline = ((params[0].toInt() and 0xFF) or ((params[1].toInt() and 0xFF) shl 8)).toShort() / 10.0
-                        Log.d(TAG, "Zwift set incline: $incline%")
-                        withTimeout(2000) { fp.setIncline(incline).await() }
-                    } else false
-                }
-                0x07 -> { Log.d(TAG, "Zwift: start"); withTimeout(2000) { fp.startWorkout(FitPro1.MIN_SPEED_KPH, 0.0).await() } }
-                0x08 -> { Log.d(TAG, "Zwift: stop"); withTimeout(2000) { fp.stopWorkout().await() } }
-                else -> { Log.d(TAG, "Unknown opcode: $opcode"); false }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Control command error", e)
-            false
-        }
-    }
-
-    private fun startMdns() {
-        val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-        val wifiInfo = wifiManager.connectionInfo
-        val ip = wifiInfo.ipAddress
-        val ipBytes = byteArrayOf(
-            (ip and 0xFF).toByte(),
-            ((ip shr 8) and 0xFF).toByte(),
-            ((ip shr 16) and 0xFF).toByte(),
-            ((ip shr 24) and 0xFF).toByte()
-        )
-        val mac = wifiInfo.macAddress ?: "00:00:00:00:00:00"
-        Log.d(TAG, "WiFi IP: ${ipBytes.joinToString(".") { (it.toInt() and 0xFF).toString() }}, MAC: $mac")
-
-        mdnsAdvertiser = MdnsAdvertiser(this, "Treadmill Bridge", DIRCON_PORT, ipBytes, mac).also { it.start() }
-    }
-
-    private fun status(msg: String, color: Int = getColor(R.color.status_yellow)) {
-        Log.d(TAG, msg)
-        statusText.text = msg
-        statusText.setTextColor(color)
     }
 }
