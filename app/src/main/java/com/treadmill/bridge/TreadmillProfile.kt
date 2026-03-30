@@ -15,12 +15,12 @@ object TreadmillProfile {
     // MIN_SPEED_KPH is the lowest safe belt speed for this hardware.
     // FTMS_SPEED_MIN is the protocol floor advertised to Zwift (lower for client compatibility).
     const val MIN_SPEED_KPH = 1.6
-    const val MAX_SPEED_KPH = 15.0
+    const val MAX_SPEED_KPH = 22.0
     const val SPEED_STEP_KPH = 1.0
 
     // FTMS advertised speed range (0.1 km/h units)
     const val FTMS_SPEED_MIN = 10    // 1.0 km/h
-    const val FTMS_SPEED_MAX = 150   // 15.0 km/h
+    const val FTMS_SPEED_MAX = 220   // 22.0 km/h
     const val FTMS_SPEED_STEP = 10   // 1.0 km/h
 
     // FTMS feature flags
