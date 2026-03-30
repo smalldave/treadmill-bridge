@@ -18,7 +18,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 class DirconServer(
     private val port: Int = 36866,
     private val dataProvider: () -> TreadmillSnapshot,
-    private val onControlCommand: suspend (opcode: Int, params: ByteArray) -> Boolean
+    private val onControlCommand: suspend (command: FtmsCommand, params: ByteArray) -> Boolean
 ) {
     companion object {
         private const val TAG = "Dircon"
@@ -32,12 +32,6 @@ class DirconServer(
         internal const val MSG_ENABLE_NOTIFY: Byte = 0x05
         internal const val MSG_UNSOLICITED_NOTIFY: Byte = 0x06
         private const val MSG_UNKNOWN_07: Byte = 0x07
-
-        // FTMS Control Point opcodes
-        const val FTMS_SET_SPEED = 0x02
-        const val FTMS_SET_INCLINE = 0x03
-        const val FTMS_START = 0x07
-        const val FTMS_STOP = 0x08
 
         // Response codes
         internal const val RESP_SUCCESS: Byte = 0x00
@@ -97,6 +91,19 @@ class DirconServer(
                 CharDef(CHAR_HR_MEASUREMENT, PROP_NOTIFY)
             ))
         )
+    }
+
+    /** FTMS Control Point opcodes as a typed enum. */
+    enum class FtmsCommand(val opcode: Int) {
+        SetSpeed(0x02),
+        SetIncline(0x03),
+        Start(0x07),
+        Stop(0x08);
+
+        companion object {
+            fun fromOpcode(value: Int): FtmsCommand? =
+                values().find { it.opcode == value }
+        }
     }
 
     /** Dircon protocol packet — shared between server and tests.
@@ -239,7 +246,7 @@ class DirconServer(
                     val response = processPacket(client, packet)
                     if (response != null) {
                         client.outputMutex.withLock {
-                            client.output.write(response)
+                            client.output.write(response.toBytes())
                             client.output.flush()
                         }
                     }
@@ -254,7 +261,7 @@ class DirconServer(
         }
     }
 
-    private suspend fun processPacket(client: ClientState, pkt: ByteArray): ByteArray? {
+    private suspend fun processPacket(client: ClientState, pkt: ByteArray): DirconPacket? {
         val req = DirconPacket.parse(pkt)
         client.seq = req.seq
 
@@ -264,7 +271,7 @@ class DirconServer(
             MSG_READ_CHAR -> handleReadChar(req.seq, req.payload)
             MSG_WRITE_CHAR -> handleWriteChar(req.seq, req.payload)
             MSG_ENABLE_NOTIFY -> handleEnableNotify(client, req.seq, req.payload)
-            MSG_UNKNOWN_07 -> respond(MSG_UNKNOWN_07, req.seq, RESP_SUCCESS, ByteArray(0))
+            MSG_UNKNOWN_07 -> DirconPacket(MSG_UNKNOWN_07, req.seq, RESP_SUCCESS, ByteArray(0))
             else -> {
                 Log.w(TAG, "Unknown msg type: ${req.msgType}")
                 null
@@ -272,17 +279,17 @@ class DirconServer(
         }
     }
 
-    private fun handleDiscoverServices(seq: Int): ByteArray {
+    private fun handleDiscoverServices(seq: Int): DirconPacket {
         val uuids = ByteArray(SERVICES.size * 16)
         SERVICES.forEachIndexed { i, svc -> uuidToBytes(svc.uuid).copyInto(uuids, i * 16) }
-        return respond(MSG_DISCOVER_SERVICES, seq, RESP_SUCCESS, uuids)
+        return DirconPacket(MSG_DISCOVER_SERVICES, seq, RESP_SUCCESS, uuids)
     }
 
-    private fun handleDiscoverChars(seq: Int, payload: ByteArray): ByteArray {
-        if (payload.size < 16) return respond(MSG_DISCOVER_CHARS, seq, RESP_SERVICE_NOT_FOUND, ByteArray(0))
+    private fun handleDiscoverChars(seq: Int, payload: ByteArray): DirconPacket {
+        if (payload.size < 16) return DirconPacket(MSG_DISCOVER_CHARS, seq, RESP_SERVICE_NOT_FOUND, ByteArray(0))
         val svcUuid = uuidFromBytes(payload)
         val svc = SERVICES.find { it.uuid == svcUuid }
-            ?: return respond(MSG_DISCOVER_CHARS, seq, RESP_SERVICE_NOT_FOUND, ByteArray(0))
+            ?: return DirconPacket(MSG_DISCOVER_CHARS, seq, RESP_SERVICE_NOT_FOUND, ByteArray(0))
 
         // Response: service UUID (16) + for each char: UUID (16) + props (1)
         val data = ByteArray(16 + svc.chars.size * 17)
@@ -291,51 +298,57 @@ class DirconServer(
             uuidToBytes(ch.uuid).copyInto(data, 16 + i * 17)
             data[16 + i * 17 + 16] = ch.props.toByte()
         }
-        return respond(MSG_DISCOVER_CHARS, seq, RESP_SUCCESS, data)
+        return DirconPacket(MSG_DISCOVER_CHARS, seq, RESP_SUCCESS, data)
     }
 
-    private fun handleReadChar(seq: Int, payload: ByteArray): ByteArray {
-        if (payload.size < 16) return respond(MSG_READ_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
+    private fun handleReadChar(seq: Int, payload: ByteArray): DirconPacket {
+        if (payload.size < 16) return DirconPacket(MSG_READ_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
         val charUuid = uuidFromBytes(payload)
         val charDef = SERVICES.flatMap { it.chars }.find { it.uuid == charUuid }
-            ?: return respond(MSG_READ_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
+            ?: return DirconPacket(MSG_READ_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
 
         val data = ByteArray(16 + charDef.readValue.size)
         uuidToBytes(charUuid).copyInto(data, 0)
         charDef.readValue.copyInto(data, 16)
-        return respond(MSG_READ_CHAR, seq, RESP_SUCCESS, data)
+        return DirconPacket(MSG_READ_CHAR, seq, RESP_SUCCESS, data)
     }
 
-    private suspend fun handleWriteChar(seq: Int, payload: ByteArray): ByteArray {
-        if (payload.size < 16) return respond(MSG_WRITE_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
+    private suspend fun handleWriteChar(seq: Int, payload: ByteArray): DirconPacket {
+        if (payload.size < 16) return DirconPacket(MSG_WRITE_CHAR, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
         val charUuid = uuidFromBytes(payload)
         val writeData = if (payload.size > 16) payload.copyOfRange(16, payload.size) else ByteArray(0)
 
         Log.d(TAG, "Write 0x${charUuid.toString(16)}: ${writeData.joinToString(" ") { "%02X".format(it) }}")
 
         if (charUuid == CHAR_FTMS_CONTROL_POINT && writeData.isNotEmpty()) {
-            // FTMS Control Point
-            val opcode = writeData[0].toInt() and 0xFF
+            val rawOpcode = writeData[0].toInt() and 0xFF
+            val command = FtmsCommand.fromOpcode(rawOpcode)
             val params = if (writeData.size > 1) writeData.copyOfRange(1, writeData.size) else ByteArray(0)
-            val ok = onControlCommand(opcode, params)
+
+            val ok = if (command != null) {
+                onControlCommand(command, params)
+            } else {
+                Log.d(TAG, "Unknown FTMS opcode: 0x${rawOpcode.toString(16)}")
+                false
+            }
 
             // Send indication response: UUID + [0x80, opcode, result]
             val indication = ByteArray(16 + 3)
             uuidToBytes(charUuid).copyInto(indication, 0)
             indication[16] = 0x80.toByte()
-            indication[17] = opcode.toByte()
+            indication[17] = rawOpcode.toByte()
             indication[18] = if (ok) 0x01 else 0x02
-            return respond(MSG_WRITE_CHAR, seq, RESP_SUCCESS, indication)
+            return DirconPacket(MSG_WRITE_CHAR, seq, RESP_SUCCESS, indication)
         }
 
         // Generic write response
         val respData = ByteArray(16)
         uuidToBytes(charUuid).copyInto(respData, 0)
-        return respond(MSG_WRITE_CHAR, seq, RESP_SUCCESS, respData)
+        return DirconPacket(MSG_WRITE_CHAR, seq, RESP_SUCCESS, respData)
     }
 
-    private fun handleEnableNotify(client: ClientState, seq: Int, payload: ByteArray): ByteArray {
-        if (payload.size < 16) return respond(MSG_ENABLE_NOTIFY, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
+    private fun handleEnableNotify(client: ClientState, seq: Int, payload: ByteArray): DirconPacket {
+        if (payload.size < 16) return DirconPacket(MSG_ENABLE_NOTIFY, seq, RESP_CHAR_NOT_FOUND, ByteArray(0))
         val charUuid = uuidFromBytes(payload)
         val enable = payload.size >= 17 && payload[16].toInt() != 0
 
@@ -349,7 +362,7 @@ class DirconServer(
 
         val respData = ByteArray(16)
         uuidToBytes(charUuid).copyInto(respData, 0)
-        return respond(MSG_ENABLE_NOTIFY, seq, RESP_SUCCESS, respData)
+        return DirconPacket(MSG_ENABLE_NOTIFY, seq, RESP_SUCCESS, respData)
     }
 
     private suspend fun pushNotifications() {
@@ -366,7 +379,7 @@ class DirconServer(
                     uuidToBytes(CHAR_TREADMILL_DATA).copyInto(payload, 0)
                     treadmillData.copyInto(payload, 16)
 
-                    val pkt = respond(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload)
+                    val pkt = DirconPacket(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload).toBytes()
                     client.outputMutex.withLock {
                         client.output.write(pkt)
                         client.output.flush()
@@ -379,7 +392,7 @@ class DirconServer(
                     uuidToBytes(CHAR_HR_MEASUREMENT).copyInto(payload, 0)
                     hrData.copyInto(payload, 16)
 
-                    val pkt = respond(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload)
+                    val pkt = DirconPacket(MSG_UNSOLICITED_NOTIFY, 0, RESP_SUCCESS, payload).toBytes()
                     client.outputMutex.withLock {
                         client.output.write(pkt)
                         client.output.flush()
@@ -390,10 +403,5 @@ class DirconServer(
             }
         }
     }
-
-    // --- Helpers ---
-
-    private fun respond(msgType: Byte, seq: Int, respCode: Byte, payload: ByteArray): ByteArray =
-        DirconPacket(msgType, seq, respCode, payload).toBytes()
 
 }

@@ -49,7 +49,7 @@ class DirconServerTest {
 
     private fun startServer(
         snapshot: DirconServer.TreadmillSnapshot = DirconServer.TreadmillSnapshot(),
-        onControlCommand: suspend (Int, ByteArray) -> Boolean = { _, _ -> false }
+        onControlCommand: suspend (DirconServer.FtmsCommand, ByteArray) -> Boolean = { _, _ -> false }
     ): Pair<DirconServer, Int> {
         // Use port 0 to let the OS assign an ephemeral port, avoiding collisions
         val ss = java.net.ServerSocket(0)
@@ -173,10 +173,10 @@ class DirconServerTest {
     // ========== Write / FTMS Control Point ==========
 
     @Test fun `write FTMS control point fires callback with opcode and params`() {
-        var receivedOpcode = -1
+        var receivedCommand: DirconServer.FtmsCommand? = null
         var receivedParams = ByteArray(0)
-        val (server, port) = startServer(onControlCommand = { opcode, params ->
-            receivedOpcode = opcode
+        val (server, port) = startServer(onControlCommand = { command, params ->
+            receivedCommand = command
             receivedParams = params
             true
         })
@@ -190,7 +190,7 @@ class DirconServerTest {
 
             val resp = readPacket(client.getInputStream())
             assertEquals(RESP_SUCCESS, resp.respCode)
-            assertEquals(0x02, receivedOpcode)
+            assertEquals(DirconServer.FtmsCommand.SetSpeed, receivedCommand)
             assertEquals(2, receivedParams.size)
             assertEquals(0x52, receivedParams[0].toInt() and 0xFF)
             assertEquals(0x03, receivedParams[1].toInt() and 0xFF)

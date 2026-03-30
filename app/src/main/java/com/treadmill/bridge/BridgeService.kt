@@ -240,8 +240,8 @@ class BridgeService : Service() {
             connectWithRetry(device)
         }
 
-        val server = DirconServer(DIRCON_PORT, { fp.snapshotFlow.value }) { opcode, params ->
-            handleControlCommand(fp, opcode, params)
+        val server = DirconServer(DIRCON_PORT, { fp.snapshotFlow.value }) { command, params ->
+            handleControlCommand(fp, command, params)
         }
         server.start()
 
@@ -255,34 +255,30 @@ class BridgeService : Service() {
         return@withContext true
     }
 
-    private suspend fun handleControlCommand(fp: FitPro1, opcode: Int, params: ByteArray): Boolean {
+    private suspend fun handleControlCommand(fp: FitPro1, command: DirconServer.FtmsCommand, params: ByteArray): Boolean {
         return try {
-            when (opcode) {
-                DirconServer.FTMS_SET_SPEED -> {
+            when (command) {
+                DirconServer.FtmsCommand.SetSpeed -> {
                     if (params.size >= 2) {
                         val speed = params.leU16At(0) / 100.0
                         Log.d(TAG, "Zwift set speed: $speed km/h")
                         withTimeout(2000) { fp.setSpeed(speed).await() }
                     } else false
                 }
-                DirconServer.FTMS_SET_INCLINE -> {
+                DirconServer.FtmsCommand.SetIncline -> {
                     if (params.size >= 2) {
                         val incline = params.leS16At(0) / 10.0
                         Log.d(TAG, "Zwift set incline: $incline%")
                         withTimeout(2000) { fp.setIncline(incline).await() }
                     } else false
                 }
-                DirconServer.FTMS_START -> {
+                DirconServer.FtmsCommand.Start -> {
                     Log.d(TAG, "Zwift: start")
                     withTimeout(2000) { fp.startWorkout(TreadmillProfile.MIN_SPEED_KPH, 0.0).await() }
                 }
-                DirconServer.FTMS_STOP -> {
+                DirconServer.FtmsCommand.Stop -> {
                     Log.d(TAG, "Zwift: stop")
                     withTimeout(2000) { fp.stopWorkout().await() }
-                }
-                else -> {
-                    Log.d(TAG, "Unknown opcode: $opcode")
-                    false
                 }
             }
         } catch (e: Exception) {
