@@ -386,32 +386,30 @@ class FitPro1Test {
 
     // ========== Zwift-initiated startWorkout resets distance ==========
 
-    @Test fun `startWorkout resets distance and elapsed time`() {
+    @Test fun `running transition resets distance and elapsed time`() {
         val fake = FakeUsbTransport()
         val fp = FitPro1(fake)
 
-        // Script polls with nonzero speed to accumulate distance
+        // Phase 1: Running with speed — accumulate distance
         repeat(5) { fake.scriptResponse(pollResponse(10.0, 2, 0.0, false)) }
 
         fp.startUsbLoop()
         try {
-            Thread.sleep(1500)
+            Thread.sleep(3000) // exhaust phase 1 responses
             val snapshotBefore = fp.snapshotFlow.value
             assertTrue(snapshotBefore.distanceM > 0, "Should have accumulated distance")
 
-            // Now call startWorkout (simulating Zwift start) — should reset counters
-            repeat(5) { fake.scriptResponse(doneResponse(2)) }
-            val deferred = fp.startWorkout(1.6, 0.0)
-            runBlocking { withTimeout(3000) { deferred.await() } }
-            Thread.sleep(100)
+            // Phase 2: transition to Idle
+            repeat(5) { fake.scriptResponse(pollResponse(0.0, 1, 0.0, false)) }
+            Thread.sleep(3000)
 
-            // Next poll should show reset distance
-            repeat(3) { fake.scriptResponse(pollResponse(1.6, 2, 0.0, false)) }
-            Thread.sleep(1500)
+            // Phase 3: transition back to Running at zero speed — resets distance
+            repeat(5) { fake.scriptResponse(pollResponse(0.0, 2, 0.0, false)) }
+            Thread.sleep(3000)
 
             val snapshotAfter = fp.snapshotFlow.value
-            assertTrue(snapshotAfter.distanceM < snapshotBefore.distanceM,
-                "Distance should have been reset by startWorkout")
+            assertEquals(0, snapshotAfter.distanceM,
+                "Distance should have been reset on running transition")
         } finally {
             fp.stopUsbLoop()
         }

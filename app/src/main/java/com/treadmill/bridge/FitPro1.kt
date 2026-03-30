@@ -39,6 +39,7 @@ class FitPro1(
 
         const val WORKOUT_MODE_IDLE = 1
         const val WORKOUT_MODE_RUNNING = 2
+        const val WORKOUT_MODE_RESULTS = 4
     }
 
     // ========== Command Channel ==========
@@ -59,7 +60,9 @@ class FitPro1(
     /** Enqueue a command for USB execution. Returns deferred with response. */
     fun enqueue(request: ByteArray, readDelayMs: Long = 80, label: String = ""): Deferred<ByteArray?> {
         val cmd = UsbCommand(request, readDelayMs, label)
-        commandChannel.trySend(cmd)
+        if (commandChannel.trySend(cmd).isFailure) {
+            cmd.deferred.complete(null)
+        }
         return cmd.deferred
     }
 
@@ -77,10 +80,14 @@ class FitPro1(
     private val _snapshotFlow = MutableStateFlow(DirconServer.TreadmillSnapshot())
     val snapshotFlow: StateFlow<DirconServer.TreadmillSnapshot> get() = _snapshotFlow
 
-    @Volatile private var running = false
-    private var distanceM = 0.0
-    private var startTimeMs = 0L
-    private var lastPollMs = System.currentTimeMillis()
+    /** Workout session state — owned exclusively by the USB thread (handlePollCycle). */
+    private class WorkoutSession(
+        var running: Boolean = false,
+        var distanceM: Double = 0.0,
+        var startTimeMs: Long = 0L,
+        var lastPollMs: Long = System.currentTimeMillis()
+    )
+    private var session = WorkoutSession()
     var onStateUpdate: ((TreadmillState) -> Unit)? = null
 
     /** Completes when the USB link is terminally dead. Owner should teardown and reconnect. */
@@ -199,8 +206,8 @@ class FitPro1(
 
         val now = System.currentTimeMillis()
         _snapshotFlow.value = DirconServer.TreadmillSnapshot(
-            state.speedKPH, state.inclinePct, 0, distanceM.toInt(),
-            if (startTimeMs > 0) ((now - startTimeMs) / 1000).toInt() else 0
+            state.speedKPH, state.inclinePct, 0, session.distanceM.toInt(),
+            if (session.startTimeMs > 0) ((now - session.startTimeMs) / 1000).toInt() else 0
         )
         onStateUpdate?.invoke(state)
         return true
@@ -233,9 +240,6 @@ class FitPro1(
     }
 
     fun startWorkout(speedKPH: Double, inclinePct: Double): Deferred<Boolean> {
-        if (!running) {
-            running = true; startTimeMs = System.currentTimeMillis(); distanceM = 0.0
-        }
         val speedRaw = (speedKPH * 100).toInt()
         val inclineRaw = (inclinePct * 100).toInt()
         val content = byteArrayOf(
@@ -249,14 +253,14 @@ class FitPro1(
 
     fun stopWorkout(): Deferred<Boolean> {
         val content = byteArrayOf(2, 0x00, 0x10, WORKOUT_MODE_IDLE.toByte(), 0)
-        running = false
         return enqueueAndMap(buildCmd(CMD_READ_WRITE_DATA, content), "stopWorkout")
     }
 
-    @OptIn(ExperimentalCoroutinesApi::class)
     private fun enqueueAndMap(request: ByteArray, label: String): Deferred<Boolean> {
         val cmd = UsbCommand(request, label = label)
-        commandChannel.trySend(cmd)
+        if (commandChannel.trySend(cmd).isFailure) {
+            cmd.deferred.complete(null)
+        }
         val result = CompletableDeferred<Boolean>()
         cmd.deferred.invokeOnCompletion {
             result.complete(isSuccess(cmd.deferred.getCompleted()))
@@ -271,24 +275,30 @@ class FitPro1(
 
     private fun handlePollCycle(state: TreadmillState) {
         val now = System.currentTimeMillis()
-        val dtSec = (now - lastPollMs) / 1000.0
-        lastPollMs = now
-        if (state.speedKPH > 0) distanceM += (state.speedKPH / 3.6) * dtSec
+        val dtSec = (now - session.lastPollMs) / 1000.0
+        session.lastPollMs = now
+        if (state.speedKPH > 0) session.distanceM += (state.speedKPH / 3.6) * dtSec
 
-        // Auto-dismiss Results mode → return to Idle.
-        // Note: stopWorkout()/startWorkout() enqueue via commandChannel.trySend().
+        // State transitions — session state is owned exclusively here on the USB thread.
+        // stopWorkout()/startWorkout() only enqueue USB commands via commandChannel.trySend().
         // The command drain coroutine shares this single-threaded dispatcher, so
         // enqueued commands are processed on a subsequent poll cycle, not inline.
-        if (state.workoutMode == 4) { // Results
+
+        if (state.workoutMode == WORKOUT_MODE_RESULTS) {
             Log.d(TAG, "Results mode — dismissing to Idle")
             stopWorkout()
         }
 
-        if (state.startRequested && !running) {
+        if (state.startRequested && !session.running) {
             Log.d(TAG, "START pressed")
             startWorkout(TreadmillProfile.MIN_SPEED_KPH, state.inclinePct)
-        } else if (!state.startRequested && running && state.speedKPH == 0.0) {
-            Log.d(TAG, "Stopped"); running = false
+        }
+
+        // Transition running state based on observed device mode
+        if (state.workoutMode == WORKOUT_MODE_RUNNING && !session.running) {
+            session = WorkoutSession(running = true, startTimeMs = now)
+        } else if (state.workoutMode != WORKOUT_MODE_RUNNING && session.running) {
+            session.running = false
         }
     }
 
@@ -303,7 +313,13 @@ class FitPro1(
         return isSuccess(resp)
     }
 
-    /** Low-level USB write+read. Called ONLY from USB thread or init. */
+    /**
+     * Low-level USB write+read. Called ONLY from USB thread or init.
+     * Uses Thread.sleep rather than coroutine delay because:
+     * - bulkTransfer is already a blocking JNI call
+     * - the delay is a hardware timing gap, not a cancellation point
+     * - this runs on a dedicated single-thread dispatcher, so blocking is safe
+     */
     private fun sendAndRead(request: ByteArray, label: String, readDelayMs: Long): ByteArray? {
         Log.d(TAG, "$label TX: ${request.joinToString(" ") { "%02X".format(it) }}")
         if (!transport.write(request)) {

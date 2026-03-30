@@ -121,7 +121,7 @@ class BridgeService : Service() {
         ) : BridgeState()
     }
 
-    private var bridge: BridgeState = BridgeState.Disconnected
+    @Volatile private var bridge: BridgeState = BridgeState.Disconnected
     private var readCount = 0
     private var errorCount = 0
 
@@ -202,12 +202,12 @@ class BridgeService : Service() {
         }
         val session = UsbSession(connection, intf)
 
-        if (intf.endpointCount < 2) { session.close(); return@withContext false }
+        val endpoints = List(intf.endpointCount) { intf.getEndpoint(it) }
+        val writeEp = endpoints.firstOrNull { it.direction == UsbConstants.USB_DIR_OUT }
+        val readEp = endpoints.firstOrNull { it.direction == UsbConstants.USB_DIR_IN }
+        if (writeEp == null || readEp == null) { session.close(); return@withContext false }
 
         withContext(Dispatchers.Main) { updateStatus("Handshaking…", R.color.status_yellow) }
-
-        val writeEp = intf.getEndpoint(1)
-        val readEp = intf.getEndpoint(0)
         val transport = object : UsbTransport {
             override fun write(data: ByteArray) =
                 connection.bulkTransfer(writeEp, data, data.size, 50) >= 0
