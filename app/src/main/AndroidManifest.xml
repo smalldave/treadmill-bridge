@@ -11,6 +11,7 @@
 
     <application
         android:label="Treadmill Bridge"
+        android:icon="@drawable/ic_treadmill"
         android:theme="@android:style/Theme.DeviceDefault">
 
         <activity
