@@ -34,12 +34,10 @@ object FtmsEncoder {
 
         // Instantaneous speed (uint16 LE, 0.01 km/h)
         val speed100 = (speedKPH * 100).roundToInt().coerceIn(0, 65535)
-        buf[2] = (speed100 and 0xFF).toByte()
-        buf[3] = ((speed100 shr 8) and 0xFF).toByte()
+        buf.putLeU16(2, speed100)
 
         // Average speed (same as instantaneous)
-        buf[4] = buf[2]
-        buf[5] = buf[3]
+        buf.putLeU16(4, speed100)
 
         // Total distance (uint24 LE, meters)
         val dist = distanceM.coerceIn(0, 0xFFFFFF)
@@ -49,22 +47,19 @@ object FtmsEncoder {
 
         // Inclination (int16 LE, 0.1%)
         val incline10 = (inclinePct * 10).roundToInt().coerceIn(-3276, 3276)
-        buf[9] = (incline10 and 0xFF).toByte()
-        buf[10] = ((incline10 shr 8) and 0xFF).toByte()
+        buf.putLeU16(9, incline10)
 
         // Ramp angle (int16 LE, 0.1 degrees) = arctan(incline/100) in degrees * 10
         val rampDeg = Math.toDegrees(atan(inclinePct / 100.0))
         val ramp10 = (rampDeg * 10).roundToInt()
-        buf[11] = (ramp10 and 0xFF).toByte()
-        buf[12] = ((ramp10 shr 8) and 0xFF).toByte()
+        buf.putLeU16(11, ramp10)
 
         // Heart rate (uint8)
         buf[13] = heartRate.coerceIn(0, 255).toByte()
 
         // Elapsed time (uint16 LE, seconds)
         val elapsed = elapsedSec.coerceIn(0, 65535)
-        buf[14] = (elapsed and 0xFF).toByte()
-        buf[15] = ((elapsed shr 8) and 0xFF).toByte()
+        buf.putLeU16(14, elapsed)
 
         return buf
     }

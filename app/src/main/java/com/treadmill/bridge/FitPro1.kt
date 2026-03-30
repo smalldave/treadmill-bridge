@@ -345,7 +345,7 @@ class FitPro1(
     }
 
     private fun buildWriteU16Cmd(bf: Int, value: Int): ByteArray {
-        return buildWriteFieldCmd(bf, byteArrayOf((value and 0xFF).toByte(), ((value shr 8) and 0xFF).toByte()))
+        return buildWriteFieldCmd(bf, leU16Bytes(value))
     }
 
     private fun buildWriteFieldCmd(bf: Int, data: ByteArray): ByteArray {

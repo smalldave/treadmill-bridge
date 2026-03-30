@@ -29,3 +29,9 @@ fun ByteArray.leS16At(offset: Int): Int =
 /** Encode a 16-bit integer as two little-endian bytes. */
 fun leU16Bytes(value: Int): ByteArray =
     byteArrayOf((value and 0xFF).toByte(), ((value shr 8) and 0xFF).toByte())
+
+/** Write a 16-bit integer as two little-endian bytes into an existing array at the given offset. */
+fun ByteArray.putLeU16(offset: Int, value: Int) {
+    this[offset] = (value and 0xFF).toByte()
+    this[offset + 1] = ((value shr 8) and 0xFF).toByte()
+}
